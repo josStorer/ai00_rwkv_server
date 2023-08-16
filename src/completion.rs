@@ -33,11 +33,11 @@ impl Default for CompletionRequest {
     fn default() -> Self {
         Self {
             prompt: OptionArray::default(),
-            max_tokens: 256,
+            max_tokens: 1024,
             stop: OptionArray::default(),
             stream: false,
             temperature: 1.0,
-            top_p: 1.0,
+            top_p: 0.3,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             logit_bias: HashMap::new(),
@@ -100,6 +100,7 @@ async fn completions_one(
         sender,
         model_name,
         tokenizer,
+        ..
     }): State<ThreadState>,
     Json(request): Json<CompletionRequest>,
 ) -> Json<CompletionResponse> {
@@ -177,6 +178,7 @@ async fn completions_stream(
         sender,
         model_name,
         tokenizer,
+        ..
     }): State<ThreadState>,
     Json(request): Json<CompletionRequest>,
 ) -> Sse<impl Stream<Item = Result<Event>>> {

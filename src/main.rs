@@ -11,12 +11,10 @@ use qp_trie::Trie;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsStr,
     fs::File,
-    io::{BufReader, Cursor, Read},
+    io::{BufReader, Read},
     net::{Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
-    str::FromStr,
+    path::{Path, PathBuf}
 };
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use web_rwkv::{
@@ -29,6 +27,8 @@ mod completion;
 mod embedding;
 mod models;
 mod sampler;
+mod switch_model;
+mod root;
 
 use crate::sampler::Sampler;
 
@@ -69,8 +69,8 @@ pub enum OptionArray<T> {
 }
 
 impl<T> From<OptionArray<T>> for Vec<T>
-where
-    T: std::fmt::Debug + Clone + Serialize,
+    where
+        T: std::fmt::Debug + Clone + Serialize,
 {
     fn from(value: OptionArray<T>) -> Self {
         match value {
@@ -108,7 +108,9 @@ pub struct TokenCounter {
 
 #[derive(Clone)]
 pub struct ThreadState {
+    pub quant: Option<usize>,
     pub sender: flume::Sender<ThreadRequest>,
+    pub receiver: Receiver<ThreadRequest>,
     pub model_name: String,
     pub tokenizer: Tokenizer,
 }
@@ -156,13 +158,6 @@ fn load_model<P: AsRef<Path>>(
         .with_quantization(quantization)
         .build()?;
     Ok(model)
-}
-
-fn load_web<P: AsRef<Path>>(path: P, target: &Path) -> Result<()> {
-    let file = File::open(path)?;
-    let map = unsafe { Mmap::map(&file)? };
-    zip_extract::extract(Cursor::new(&map), target, false)?;
-    Ok(())
 }
 
 fn _monitor(env: Environment, tokenizer: Tokenizer, receiver: Receiver<ThreadRequest>) {
@@ -216,10 +211,10 @@ fn model_task(model: Model, tokenizer: Tokenizer, receiver: Receiver<ThreadReque
     loop {
         let (request, mut occurrences, token_sender) = match receiver.recv() {
             Ok(ThreadRequest::Generate {
-                request,
-                occurrences,
-                token_sender,
-            }) => (request, occurrences, token_sender),
+                   request,
+                   occurrences,
+                   token_sender,
+               }) => (request, occurrences, token_sender),
             Ok(ThreadRequest::Reload(_)) => break,
             Err(_) => continue,
         };
@@ -372,17 +367,6 @@ async fn main() -> Result<()> {
         .init()?;
 
     let args = Args::parse();
-    let model_path = PathBuf::from(
-        args.model
-            .unwrap_or("assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st".into()),
-    );
-    let model_name = model_path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(String::from_str)
-        .and_then(Result::ok)
-        .map(|name| name.replace(".st", ""))
-        .unwrap();
 
     let tokenizer_path = PathBuf::from(
         args.tokenizer
@@ -390,30 +374,16 @@ async fn main() -> Result<()> {
     );
 
     let (sender, receiver) = flume::unbounded::<ThreadRequest>();
-    let env = create_environment(args.adepter).await?;
     let tokenizer = load_tokenizer(&tokenizer_path)?;
-
-    log::info!("{:#?}", env.adapter.get_info());
-
-    {
-        let quantization = match args.quant {
-            None => Quantization::None,
-            Some(layer) => {
-                let mut layers = LayerFlags::empty();
-                (0..layer).for_each(|layer| layers |= LayerFlags::from_layer(layer as u64));
-                Quantization::Int8(layers)
-            }
-        };
-        let model = load_model(env.clone(), model_path, quantization)?;
-        let tokenizer = tokenizer.clone();
-        std::thread::spawn(move || model_task(model, tokenizer, receiver));
-    }
 
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.into_path();
-    load_web("assets/www.zip", &temp_path)?;
+    // load_web("assets/www.zip", &temp_path)?;
 
     let app = Router::new()
+        .route("/", get(root::read_root))
+        .route("/exit", post(root::exit))
+        .route("/switch-model", post(switch_model::switch_model))
         .route("/models", get(models::models))
         .route("/v1/models", get(models::models))
         .route("/completions", post(completion::completions))
@@ -425,8 +395,10 @@ async fn main() -> Result<()> {
         .fallback_service(ServeDir::new(temp_path.join("www")))
         .layer(CorsLayer::permissive())
         .with_state(ThreadState {
+            quant: args.quant,
             sender,
-            model_name,
+            receiver,
+            model_name: "rwkv".into(),
             tokenizer,
         });
 

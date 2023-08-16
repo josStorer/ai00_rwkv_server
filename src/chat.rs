@@ -60,11 +60,11 @@ impl Default for ChatRequest {
     fn default() -> Self {
         Self {
             messages: OptionArray::default(),
-            max_tokens: 256,
+            max_tokens: 1024,
             stop: OptionArray::Item("\n\n".into()),
             stream: false,
             temperature: 1.0,
-            top_p: 1.0,
+            top_p: 0.3,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             logit_bias: HashMap::new(),
@@ -138,6 +138,7 @@ async fn chat_completions_one(
         sender,
         model_name,
         tokenizer,
+        ..
     }): State<ThreadState>,
     Json(request): Json<ChatRequest>,
 ) -> Json<ChatResponse> {
@@ -226,6 +227,7 @@ async fn chat_completions_stream(
         sender,
         model_name,
         tokenizer,
+        ..
     }): State<ThreadState>,
     Json(request): Json<ChatRequest>,
 ) -> Sse<impl Stream<Item = Result<Event>>> {
