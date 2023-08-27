@@ -66,7 +66,7 @@ impl Default for ChatRequest {
             temperature: 1.0,
             top_p: 0.3,
             presence_penalty: 0.0,
-            frequency_penalty: 0.0,
+            frequency_penalty: 1.0,
             logit_bias: HashMap::new(),
         }
     }
