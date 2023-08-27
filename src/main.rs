@@ -346,7 +346,7 @@ fn model_task(model: Model, tokenizer: Tokenizer, receiver: Receiver<ThreadReque
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long, short)]
-    adepter: Option<usize>,
+    adaptor: Option<usize>,
     #[arg(long, short, value_name = "FILE")]
     model: Option<String>,
     #[arg(long, short, value_name = "FILE")]
