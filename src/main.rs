@@ -1,4 +1,5 @@
 use std::{
+    env,
     collections::HashMap,
     convert::Infallible,
     fs::{File},
@@ -180,7 +181,11 @@ impl Default for ReloadRequest {
             max_runtime_batch: 8,
             max_batch: 16,
             embed_layer: 2,
-            tokenizer_path: PathBuf::from("assets/rwkv_vocab_v20230424.json"),
+            tokenizer_path: env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("assets/rwkv_vocab_v20230424.json"),
             adapter: AdapterOption::Auto,
         }
     }
