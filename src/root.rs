@@ -1,5 +1,5 @@
 pub async fn read_root() -> &'static str {
-    "{{\"Hello\": \"World!\"}}"
+    "{\"Hello\":\"World!\"}"
 }
 
 pub async fn exit() {

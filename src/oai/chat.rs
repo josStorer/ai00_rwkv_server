@@ -63,14 +63,14 @@ impl Default for ChatRequest {
         Self {
             messages: Array::default(),
             names: HashMap::new(),
-            max_tokens: 256,
+            max_tokens: 1024,
             stop: Array::Item("\n\n".into()),
             stream: false,
             temperature: 1.0,
-            top_p: 1.0,
+            top_p: 0.3,
             presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            penalty_decay: 1.0,
+            frequency_penalty: 1.0,
+            penalty_decay: 0.996,
             logit_bias: HashMap::new(),
         }
     }
@@ -151,7 +151,7 @@ async fn chat_completions_one(
     Json(request): Json<ChatRequest>,
 ) -> Json<ChatResponse> {
     let info = request_info(sender.clone(), Duration::from_secs(1)).await;
-    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+    let model_name = info.reload.model.to_string_lossy().into_owned();
 
     let (token_sender, token_receiver) = flume::unbounded();
     let request = request.into();
@@ -225,7 +225,7 @@ async fn chat_completions_stream(
     Json(request): Json<ChatRequest>,
 ) -> Sse<impl Stream<Item = Result<Event>>> {
     let info = request_info(sender.clone(), Duration::from_secs(1)).await;
-    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+    let model_name = info.reload.model.to_string_lossy().into_owned();
 
     let (token_sender, token_receiver) = flume::unbounded();
     let request = request.into();

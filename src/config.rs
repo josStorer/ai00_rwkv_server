@@ -17,15 +17,15 @@ impl From<Config> for ReloadRequest {
     fn from(value: Config) -> Self {
         let Config {
             model:
-                Model {
-                    path: model_path,
-                    quant,
-                    token_chunk_size,
-                    head_chunk_size,
-                    max_runtime_batch,
-                    max_batch,
-                    embed_layer,
-                },
+            Model {
+                path: model_path,
+                quant: _,
+                token_chunk_size,
+                head_chunk_size,
+                max_runtime_batch,
+                max_batch,
+                embed_layer,
+            },
             lora,
             tokenizer: Tokenizer {
                 path: tokenizer_path,
@@ -33,9 +33,9 @@ impl From<Config> for ReloadRequest {
             adapter,
         } = value;
         Self {
-            model_path,
+            model: model_path,
             lora,
-            quant,
+            strategy: "fp16".into(),
             token_chunk_size,
             head_chunk_size,
             max_runtime_batch,

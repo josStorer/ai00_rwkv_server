@@ -46,7 +46,7 @@ pub async fn embeddings(
     Json(request): Json<EmbeddingRequest>,
 ) -> Json<EmbeddingResponse> {
     let info = request_info(sender.clone(), Duration::from_secs(1)).await;
-    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+    let model_name = info.reload.model.to_string_lossy().into_owned();
 
     let (token_sender, token_receiver) = flume::unbounded();
     let _ = sender.send(ThreadRequest::Generate {

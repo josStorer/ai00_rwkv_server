@@ -20,7 +20,7 @@ pub async fn models(State(ThreadState(sender)): State<ThreadState>) -> Json<Mode
     let info = request_info(sender, Duration::from_secs(1)).await;
     let model_name = info
         .reload
-        .model_path
+        .model
         .file_stem()
         .map(|stem| stem.to_string_lossy())
         .unwrap_or_default();
