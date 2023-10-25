@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -7,39 +7,40 @@ use axum::{
     Json,
 };
 use futures_util::{Stream, StreamExt};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    sampler::Sampler, FinishReason, GenerateRequest, OptionArray, ThreadRequest, ThreadState,
-    Token, TokenCounter, MAX_PENALTY_COUNT,
+    request_info, sampler::Sampler, Array, FinishReason, GenerateRequest, ThreadRequest,
+    ThreadState, Token, TokenCounter,
 };
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct CompletionRequest {
-    pub prompt: OptionArray<String>,
-    pub max_tokens: usize,
-    pub stop: OptionArray<String>,
-    pub stream: bool,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub presence_penalty: f32,
-    pub frequency_penalty: f32,
-    pub logit_bias: HashMap<u16, f32>,
+    prompt: Array<String>,
+    max_tokens: usize,
+    stop: Array<String>,
+    stream: bool,
+    temperature: f32,
+    top_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    penalty_decay: f32,
+    logit_bias: HashMap<u16, f32>,
 }
 
 impl Default for CompletionRequest {
     fn default() -> Self {
         Self {
-            prompt: OptionArray::default(),
-            max_tokens: 1024,
-            stop: OptionArray::default(),
+            prompt: Array::default(),
+            max_tokens: 256,
+            stop: Array::default(),
             stream: false,
             temperature: 1.0,
-            top_p: 0.3,
+            top_p: 1.0,
             presence_penalty: 0.0,
-            frequency_penalty: 1.0,
+            frequency_penalty: 0.0,
+            penalty_decay: 1.0,
             logit_bias: HashMap::new(),
         }
     }
@@ -55,6 +56,7 @@ impl From<CompletionRequest> for GenerateRequest {
             top_p,
             presence_penalty,
             frequency_penalty,
+            penalty_decay,
             logit_bias,
             ..
         } = value;
@@ -72,50 +74,43 @@ impl From<CompletionRequest> for GenerateRequest {
                 top_p,
                 presence_penalty,
                 frequency_penalty,
+                penalty_decay,
             },
             logit_bias,
-            embedding: false,
+            ..Default::default()
         }
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct CompletionChoice {
-    pub text: String,
-    pub index: usize,
-    pub finish_reason: FinishReason,
+    text: String,
+    index: usize,
+    finish_reason: FinishReason,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
-    pub object: String,
-    pub model: String,
-    pub choices: Vec<CompletionChoice>,
+    object: String,
+    model: String,
+    choices: Vec<CompletionChoice>,
     #[serde(rename = "usage")]
-    pub counter: TokenCounter,
+    counter: TokenCounter,
 }
 
 async fn completions_one(
-    State(ThreadState {
-        sender,
-        model_name,
-        tokenizer,
-        ..
-    }): State<ThreadState>,
+    State(ThreadState(sender)): State<ThreadState>,
     Json(request): Json<CompletionRequest>,
 ) -> Json<CompletionResponse> {
+    let info = request_info(sender.clone(), Duration::from_secs(1)).await;
+    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+
     let (token_sender, token_receiver) = flume::unbounded();
-
     let request = GenerateRequest::from(request);
-    let tokens = tokenizer
-        .encode(request.prompt.as_bytes())
-        .unwrap_or_default();
-    let occurrences = tokens.into_iter().rev().take(MAX_PENALTY_COUNT).counts();
-
     let _ = sender.send(ThreadRequest::Generate {
         request,
-        occurrences,
-        token_sender,
+        tokenizer: info.tokenizer,
+        sender: token_sender,
     });
 
     let mut token_counter = TokenCounter::default();
@@ -161,39 +156,31 @@ pub enum PartialCompletionRecord {
 
 #[derive(Debug, Default, Serialize)]
 pub struct PartialCompletionChoice {
-    pub delta: PartialCompletionRecord,
-    pub index: usize,
-    pub finish_reason: FinishReason,
+    delta: PartialCompletionRecord,
+    index: usize,
+    finish_reason: FinishReason,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PartialCompletionResponse {
-    pub object: String,
-    pub model: String,
-    pub choices: Vec<PartialCompletionChoice>,
+    object: String,
+    model: String,
+    choices: Vec<PartialCompletionChoice>,
 }
 
 async fn completions_stream(
-    State(ThreadState {
-        sender,
-        model_name,
-        tokenizer,
-        ..
-    }): State<ThreadState>,
+    State(ThreadState(sender)): State<ThreadState>,
     Json(request): Json<CompletionRequest>,
 ) -> Sse<impl Stream<Item = Result<Event>>> {
+    let info = request_info(sender.clone(), Duration::from_secs(1)).await;
+    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+
     let (token_sender, token_receiver) = flume::unbounded();
-
     let request = GenerateRequest::from(request);
-    let tokens = tokenizer
-        .encode(request.prompt.as_bytes())
-        .unwrap_or_default();
-    let occurrences = tokens.into_iter().rev().take(MAX_PENALTY_COUNT).counts();
-
     let _ = sender.send(ThreadRequest::Generate {
         request,
-        occurrences,
-        token_sender,
+        tokenizer: info.tokenizer,
+        sender: token_sender,
     });
 
     let stream = token_receiver.into_stream().skip(1).map(move |token| {

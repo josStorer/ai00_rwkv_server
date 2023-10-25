@@ -1,13 +1,17 @@
+use std::time::Duration;
+
 use axum::{extract::State, Json};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::{GenerateRequest, OptionArray, ThreadRequest, ThreadState, Token, TokenCounter};
+use crate::{
+    request_info, Array, GenerateRequest, ThreadRequest, ThreadState, Token, TokenCounter,
+};
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingRequest {
-    pub input: OptionArray<String>,
+    input: Array<String>,
 }
 
 impl From<EmbeddingRequest> for GenerateRequest {
@@ -15,42 +19,40 @@ impl From<EmbeddingRequest> for GenerateRequest {
         Self {
             prompt: Vec::from(value.input).join(""),
             max_tokens: 1,
-            stop: Default::default(),
-            sampler: Default::default(),
-            logit_bias: Default::default(),
-            embedding: true,
+            embed: true,
+            ..Default::default()
         }
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct EmbeddingData {
-    pub object: String,
-    pub index: usize,
-    pub embedding: Vec<f32>,
+    object: String,
+    index: usize,
+    embedding: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EmbeddingResponse {
-    pub object: String,
-    pub model: String,
-    pub data: Vec<EmbeddingData>,
+    object: String,
+    model: String,
+    data: Vec<EmbeddingData>,
     #[serde(rename = "usage")]
-    pub counter: TokenCounter,
+    counter: TokenCounter,
 }
 
 pub async fn embeddings(
-    State(ThreadState {
-        sender, model_name, ..
-    }): State<ThreadState>,
+    State(ThreadState(sender)): State<ThreadState>,
     Json(request): Json<EmbeddingRequest>,
 ) -> Json<EmbeddingResponse> {
-    let (token_sender, token_receiver) = flume::unbounded();
+    let info = request_info(sender.clone(), Duration::from_secs(1)).await;
+    let model_name = info.reload.model_path.to_string_lossy().into_owned();
 
+    let (token_sender, token_receiver) = flume::unbounded();
     let _ = sender.send(ThreadRequest::Generate {
         request: request.into(),
-        occurrences: Default::default(),
-        token_sender,
+        tokenizer: info.tokenizer,
+        sender: token_sender,
     });
 
     let mut token_counter = TokenCounter::default();
@@ -60,8 +62,10 @@ pub async fn embeddings(
     while let Some(token) = stream.next().await {
         match token {
             Token::Stop(_, counter) => token_counter = counter,
-            Token::Embed(emb) => embedding = emb,
-            Token::Done => break,
+            Token::Embed(emb) => {
+                embedding = emb;
+                break;
+            }
             _ => {}
         }
     }

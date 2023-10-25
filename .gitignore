@@ -15,5 +15,8 @@ target/
 
 *.st
 ai00_server.exe
+qdrant/
+.qdrant-initialized
 run.bat
 node_modules/
+.vscode/

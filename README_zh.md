@@ -7,7 +7,7 @@
 [![All Contributors](https://img.shields.io/badge/all_contributors-4-orange.svg?style=flat-square)](#contributors-) 
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
  
- [English](README.md) | [中文](README_zh.md)  | [日本語](README_jp.md)
+ [English](README.md) | [中文](README_zh.md) 
 
 
 ---
@@ -34,7 +34,7 @@
 ### 💥特色
 
 - 基于`RWKV`模型，具有高性能和准确性
-- 支持`VULKAN`推理加速，不用该死的`CUDA`也能享受GPU加速！支持A卡、集成显卡等一切支持`VULKAN`的GPU
+- 支持`VULKAN`并行、并发推理，不用该死的`CUDA`也能享受GPU加速！支持A卡、集成显卡等一切支持`VULKAN`的GPU
 - 无需臃肿的`pytorch`、`CUDA`等运行环境，小巧身材，开箱即用！
 - 兼容OpenAI的ChatGPT API接口
 
@@ -59,12 +59,14 @@
 
 2. [下载模型](https://huggingface.co/cgisky/RWKV-safetensors-fp16)后把模型放在`assets/models/`路径，例如`assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
 
-3. 在命令行运行
+3. 你可以修改 [`assets/Config.toml`](./assets/Config.toml) 里面的模型配置，包括模型路径、量化层数等
+
+4. 在命令行运行
 
     ```bash     
-    $ ./ai00_rwkv_server --model assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st
+    $ ./ai00_rwkv_server
     ```
-4. 打开浏览器，访问WebUI
+5. 打开浏览器，访问WebUI
    [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
 
 ### 📜从源码编译
@@ -92,7 +94,7 @@
 5. 编译完成后运行
    
     ```bash     
-    $ cargo run --release -- --model assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st 
+    $ cargo run --release
     ```
    
 6. 打开浏览器，访问WebUI
@@ -100,32 +102,23 @@
 
     
 ## 📝支持的启动参数
-- `--model`: 模型路径
-- `--tokenizer`: 词表路径
+- `--config`: 模型配置文件路径（默认`assets/Config.toml`）
+- `--ip`: 服务器绑定的IP地址
 - `--port`: 运行端口
-- `--quant`: 指定量化层数
-- `--adepter`: 适配器（GPU和后端）选择项
-
-### 示例
-
-服务器监听3000端口，加载全部层量化（32 > 24）的0.4B模型，选择0号适配器（要查看具体适配器编号可以先不加该参数，程序会先进入选择页面）。
-```bash
-$ cargo run --release -- --model assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st --port 3000 --quant 32 --adepter 0
-```
 
 
 ## 📙目前可用的API
 
 API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API 规范。
 
-- `/v1/models`
-- `/models`
-- `/v1/chat/completions`
-- `/chat/completions`
-- `/v1/completions`
-- `/completions`
-- `/v1/embeddings`
-- `/embeddings`
+- `/api/oai/v1/models`
+- `/api/oai/models`
+- `/api/oai/v1/chat/completions`
+- `/api/oai/chat/completions`
+- `/api/oai/v1/completions`
+- `/api/oai/completions`
+- `/api/oai/v1/embeddings`
+- `/api/oai/embeddings`
 
 ## 📙WebUI 截图
 
@@ -140,9 +133,9 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 - [x] 支持`sse`推送
 - [x] 添加`embeddings`
 - [x] 集成基本的调用前端
-- [ ] `Batch serve`并行推理
+- [x] `Batch serve`并行推理
 - [x] `int8`量化支持
-- [ ] `SpQR`量化支持
+- [ ] `int4`量化支持
 - [ ] `LoRA`模型支持
 - [ ] `LoRA`模型热加载、切换
 

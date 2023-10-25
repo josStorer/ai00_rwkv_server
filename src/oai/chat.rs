@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -11,15 +11,15 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    sampler::Sampler, FinishReason, GenerateRequest, OptionArray, ThreadRequest, ThreadState,
-    Token, TokenCounter, MAX_PENALTY_COUNT,
+    request_info, sampler::Sampler, Array, FinishReason, GenerateRequest, ThreadRequest,
+    ThreadState, Token, TokenCounter,
 };
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
+    #[default]
     #[serde(alias = "system")]
     System,
-    #[default]
     #[serde(alias = "user")]
     User,
     #[serde(alias = "assistant")]
@@ -38,35 +38,39 @@ impl std::fmt::Display for Role {
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRecord {
-    pub role: Role,
-    pub content: String,
+    role: Role,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ChatRequest {
-    pub messages: OptionArray<ChatRecord>,
-    pub max_tokens: usize,
-    pub stop: OptionArray<String>,
-    pub stream: bool,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub presence_penalty: f32,
-    pub frequency_penalty: f32,
-    pub logit_bias: HashMap<u16, f32>,
+    messages: Array<ChatRecord>,
+    names: HashMap<Role, String>,
+    max_tokens: usize,
+    stop: Array<String>,
+    stream: bool,
+    temperature: f32,
+    top_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    penalty_decay: f32,
+    logit_bias: HashMap<u16, f32>,
 }
 
 impl Default for ChatRequest {
     fn default() -> Self {
         Self {
-            messages: OptionArray::default(),
-            max_tokens: 1024,
-            stop: OptionArray::Item("\n\n".into()),
+            messages: Array::default(),
+            names: HashMap::new(),
+            max_tokens: 256,
+            stop: Array::Item("\n\n".into()),
             stream: false,
             temperature: 1.0,
-            top_p: 0.3,
+            top_p: 1.0,
             presence_penalty: 0.0,
-            frequency_penalty: 1.0,
+            frequency_penalty: 0.0,
+            penalty_decay: 1.0,
             logit_bias: HashMap::new(),
         }
     }
@@ -76,23 +80,30 @@ impl From<ChatRequest> for GenerateRequest {
     fn from(value: ChatRequest) -> Self {
         let ChatRequest {
             messages,
+            names,
             max_tokens,
             stop,
             temperature,
             top_p,
             presence_penalty,
             frequency_penalty,
+            penalty_decay,
             logit_bias,
             ..
         } = value;
 
-        let prompt = Vec::from(messages)
+        let prompt = Vec::from(messages.clone())
             .into_iter()
             .map(|ChatRecord { role, content }| {
-                let role = role.to_string();
+                let role = names.get(&role).cloned().unwrap_or(role.to_string());
                 let content = content.trim();
                 format!("{role}: {content}")
             })
+            .join("\n\n");
+        let model_text = Vec::from(messages)
+            .into_iter()
+            .filter(|record| record.role == Role::Assistant)
+            .map(|record| record.content)
             .join("\n\n");
 
         let assistant = Role::Assistant.to_string();
@@ -103,6 +114,7 @@ impl From<ChatRequest> for GenerateRequest {
 
         Self {
             prompt,
+            model_text,
             max_tokens,
             stop,
             sampler: Sampler {
@@ -110,57 +122,43 @@ impl From<ChatRequest> for GenerateRequest {
                 temperature,
                 presence_penalty,
                 frequency_penalty,
+                penalty_decay,
             },
             logit_bias,
-            embedding: false,
+            ..Default::default()
         }
     }
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChatChoice {
-    pub message: ChatRecord,
-    pub index: usize,
-    pub finish_reason: FinishReason,
+struct ChatChoice {
+    message: ChatRecord,
+    index: usize,
+    finish_reason: FinishReason,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChatResponse {
-    pub object: String,
-    pub model: String,
-    pub choices: Vec<ChatChoice>,
+struct ChatResponse {
+    object: String,
+    model: String,
+    choices: Vec<ChatChoice>,
     #[serde(rename = "usage")]
-    pub counter: TokenCounter,
+    counter: TokenCounter,
 }
 
 async fn chat_completions_one(
-    State(ThreadState {
-        sender,
-        model_name,
-        tokenizer,
-        ..
-    }): State<ThreadState>,
+    State(ThreadState(sender)): State<ThreadState>,
     Json(request): Json<ChatRequest>,
 ) -> Json<ChatResponse> {
+    let info = request_info(sender.clone(), Duration::from_secs(1)).await;
+    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+
     let (token_sender, token_receiver) = flume::unbounded();
-
-    let model_text = Vec::from(request.messages.clone())
-        .into_iter()
-        .filter(|record| record.role == Role::Assistant)
-        .map(|record| record.content)
-        .join("\n\n");
-    let model_tokens = tokenizer.encode(model_text.as_bytes()).unwrap_or_default();
-    let occurrences = model_tokens
-        .into_iter()
-        .rev()
-        .take(MAX_PENALTY_COUNT)
-        .counts();
     let request = request.into();
-
     let _ = sender.send(ThreadRequest::Generate {
         request,
-        occurrences,
-        token_sender,
+        tokenizer: info.tokenizer,
+        sender: token_sender,
     });
 
     let mut token_counter = TokenCounter::default();
@@ -200,7 +198,7 @@ async fn chat_completions_one(
 
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PartialChatRecord {
+enum PartialChatRecord {
     #[default]
     #[serde(rename = "")]
     None,
@@ -209,47 +207,32 @@ pub enum PartialChatRecord {
 }
 
 #[derive(Debug, Default, Serialize)]
-pub struct PartialChatChoice {
-    pub delta: PartialChatRecord,
-    pub index: usize,
-    pub finish_reason: FinishReason,
+struct PartialChatChoice {
+    delta: PartialChatRecord,
+    index: usize,
+    finish_reason: FinishReason,
 }
 
 #[derive(Debug, Serialize)]
-pub struct PartialChatResponse {
-    pub object: String,
-    pub model: String,
-    pub choices: Vec<PartialChatChoice>,
+struct PartialChatResponse {
+    object: String,
+    model: String,
+    choices: Vec<PartialChatChoice>,
 }
 
 async fn chat_completions_stream(
-    State(ThreadState {
-        sender,
-        model_name,
-        tokenizer,
-        ..
-    }): State<ThreadState>,
+    State(ThreadState(sender)): State<ThreadState>,
     Json(request): Json<ChatRequest>,
 ) -> Sse<impl Stream<Item = Result<Event>>> {
+    let info = request_info(sender.clone(), Duration::from_secs(1)).await;
+    let model_name = info.reload.model_path.to_string_lossy().into_owned();
+
     let (token_sender, token_receiver) = flume::unbounded();
-
-    let model_text = Vec::from(request.messages.clone())
-        .into_iter()
-        .filter(|record| record.role == Role::Assistant)
-        .map(|record| record.content)
-        .join("\n\n");
-    let model_tokens = tokenizer.encode(model_text.as_bytes()).unwrap_or_default();
-    let occurrences = model_tokens
-        .into_iter()
-        .rev()
-        .take(MAX_PENALTY_COUNT)
-        .counts();
     let request = request.into();
-
     let _ = sender.send(ThreadRequest::Generate {
         request,
-        occurrences,
-        token_sender,
+        tokenizer: info.tokenizer,
+        sender: token_sender,
     });
 
     let stream = token_receiver.into_stream().map(move |token| {

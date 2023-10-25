@@ -1,19 +1,29 @@
 # 💯AI00 RWKV Server
 <p align='center'>
 <image src="docs/ai00.gif" />
+    
 </p>
- 
-<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section --> 
-[![All Contributors](https://img.shields.io/badge/all_contributors-4-orange.svg?style=flat-square)](#contributors-) 
+
+<div align="center"> 
+    
+![license](https://shields.io/badge/license-MIT%2FApache--2.0-blue)
+[![Rust Version](https://img.shields.io/badge/Rust-1.65.0+-blue)](https://releases.rs/docs/1.65.0)
+![PRs welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)     
+<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
+[![All Contributors](https://img.shields.io/badge/all_contributors-5-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
- 
- [English](README.md) | [中文](README_zh.md)  | [日本語](README_jp.md)
- 
+
+
+
+[English](README.md) | [中文](README_zh.md) 
+
 ---
 
+<div align="left">
+    
 `AI00 RWKV Server` is an inference API server based on the [`RWKV` model](https://github.com/BlinkDL/ChatRWKV).
 
-It supports `VULKAN` inference acceleration and can run on all GPUs that support `VULKAN`. No need for Nvidia cards!!! AMD cards and even integrated graphics can be accelerated!!!
+It supports `VULKAN` parallel and concurrent batched inference and can run on all GPUs that support `VULKAN`. No need for Nvidia cards!!! AMD cards and even integrated graphics can be accelerated!!!
 
 No need for bulky `pytorch`, `CUDA` and other runtime environments, it's compact and ready to use out of the box!
 
@@ -54,14 +64,16 @@ QQ Group for communication: 30920262
 1.  Directly download the latest version from [Release](https://github.com/cgisky1980/ai00_rwkv_server/releases)
     
 2.  After [downloading the model](https://huggingface.co/cgisky/RWKV-safetensors-fp16), place the model in the `assets/models/` path, for example, `assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
+
+3.  Optionally modify [`assets/Config.toml`](./assets/Config.toml) for model configurations like model path, quantization layers, etc.
     
-3.  Run in the command line
+4.  Run in the command line
     
     ```bash
-    $ ./ai00_rwkv_server --model assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st
+    $ ./ai00_rwkv_server
     ```
     
-4.  Open the browser and visit the WebUI [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
+5.  Open the browser and visit the WebUI [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
     
 
 ### 📜Compile from Source Code
@@ -71,7 +83,8 @@ QQ Group for communication: 30920262
 2.  Clone this repository
     
     ```bash
-    $ git clone https://github.com/cgisky1980/ai00_rwkv_server.git $ cd ai00_rwkv_server
+    $ git clone https://github.com/cgisky1980/ai00_rwkv_server.git
+    $ cd ai00_rwkv_server
     ```
     
 3.  After [downloading the model](https://huggingface.co/cgisky/RWKV-safetensors-fp16), place the model in the `assets/models/` path, for example, `assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
@@ -85,7 +98,7 @@ QQ Group for communication: 30920262
 5.  After compilation, run
     
     ```bash
-    $ cargo run --release -- --model assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st
+    $ cargo run --release
     ```
     
 6.  Open the browser and visit the WebUI [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
@@ -93,32 +106,23 @@ QQ Group for communication: 30920262
 
 ## 📝Supported Arguments
 
-*   `--model`: Model path
-*   `--tokenizer`: Tokenizer path
+*   `--config`: Configure file path (default: `assets/Config.toml`)
+*   `--ip`: The IP address the server is bound to
 *   `--port`: Running port
-*   `--quant`: Specify the number of quantization layers
-*   `--adepter`: Adapter (GPU and backend) selection options
 
-### Example
-
-The server listens on port 3000, loads the full-layer quantized (32 > 24) 0.4B model, and selects adapter 0 (to get the specific adapter number, you can first not add this parameter, and the program will enter the adapter selection page).
-
-```bash
-$ cargo run --release -- --model assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st --port 3000 --quant 32 --adepter 0
-```
 
 ## 📙Currently Available APIs
 
 The API service starts at port 65530, and the data input and output format follow the Openai API specification.
 
-*   `/v1/models`
-*   `/models`
-*   `/v1/chat/completions`
-*   `/chat/completions`
-*   `/v1/completions`
-*   `/completions`
-*   `/v1/embeddings`
-*   `/embeddings`
+*   `/api/oai/v1/models`
+*   `/api/oai/models`
+*   `/api/oai/v1/chat/completions`
+*   `/api/oai/chat/completions`
+*   `/api/oai/v1/completions`
+*   `/api/oai/completions`
+*   `/api/oai/v1/embeddings`
+*   `/api/oai/embeddings`
 
 ## 📙WebUI Screenshots
 
@@ -132,9 +136,9 @@ The API service starts at port 65530, and the data input and output format follo
 *   [x] Support for sse push
 *   [x] Add `embeddings`
 *   [x] Integrate basic front-end
-*   [ ] Parallel inference via `batch serve`
+*   [x] Parallel inference via `batch serve`
 *   [x] Support for `int8` quantization
-*   [ ] Support for `SpQR` quantization
+*   [ ] Support for `int4` quantization
 *   [ ] Support for `LoRA` model
 *   [ ] Hot loading and switching of `LoRA` model
 
@@ -171,6 +175,7 @@ We can't wait to work with you to make this project better! We hope the project 
       <td align="center" valign="top" width="14.28%"><a href="http://cryscan.github.io/profile"><img src="https://avatars.githubusercontent.com/u/16053640?v=4?s=100" width="100px;" alt="研究社交"/><br /><sub><b>研究社交</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=cryscan" title="Code">💻</a> <a href="#example-cryscan" title="Examples">💡</a> <a href="#ideas-cryscan" title="Ideas, Planning, & Feedback">🤔</a> <a href="#maintenance-cryscan" title="Maintenance">🚧</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/pulls?q=is%3Apr+reviewed-by%3Acryscan" title="Reviewed Pull Requests">👀</a> <a href="#platform-cryscan" title="Packaging/porting to new platform">📦</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/josStorer"><img src="https://avatars.githubusercontent.com/u/13366013?v=4?s=100" width="100px;" alt="josc146"/><br /><sub><b>josc146</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/issues?q=author%3AjosStorer" title="Bug reports">🐛</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=josStorer" title="Code">💻</a> <a href="#ideas-josStorer" title="Ideas, Planning, & Feedback">🤔</a> <a href="#tool-josStorer" title="Tools">🔧</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/l15y"><img src="https://avatars.githubusercontent.com/u/11372524?v=4?s=100" width="100px;" alt="l15y"/><br /><sub><b>l15y</b></sub></a><br /><a href="#tool-l15y" title="Tools">🔧</a> <a href="#plugin-l15y" title="Plugin/utility libraries">🔌</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=l15y" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://www.linkedin.com/in/cahyawirawan/"><img src="https://avatars.githubusercontent.com/u/7669893?v=4?s=100" width="100px;" alt="Cahya Wirawan"/><br /><sub><b>Cahya Wirawan</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/issues?q=author%3Acahya-wirawan" title="Bug reports">🐛</a></td>
     </tr>
   </tbody>
 </table>
