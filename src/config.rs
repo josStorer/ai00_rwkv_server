@@ -17,15 +17,16 @@ impl From<Config> for ReloadRequest {
     fn from(value: Config) -> Self {
         let Config {
             model:
-            Model {
-                path: model_path,
-                quant: _,
-                token_chunk_size,
-                head_chunk_size,
-                max_runtime_batch,
-                max_batch,
-                embed_layer,
-            },
+                Model {
+                    path: model_path,
+                    quant:_,
+                    turbo,
+                    token_chunk_size,
+                    head_chunk_size,
+                    max_runtime_batch,
+                    max_batch,
+                    embed_layer,
+                },
             lora,
             tokenizer: Tokenizer {
                 path: tokenizer_path,
@@ -36,6 +37,7 @@ impl From<Config> for ReloadRequest {
             model: model_path,
             lora,
             strategy: "fp16".into(),
+            turbo,
             token_chunk_size,
             head_chunk_size,
             max_runtime_batch,
@@ -54,6 +56,8 @@ pub struct Model {
     pub path: PathBuf,
     /// Specify layers that needs to be quantized.
     pub quant: usize,
+    /// Whether to use alternative GEMM kernel to speed-up long prompts.
+    pub turbo: bool,
     /// Maximum tokens to be processed in parallel at once.
     pub token_chunk_size: usize,
     /// The chunk size for each split of the head matrix.
@@ -71,6 +75,7 @@ impl Default for Model {
         Self {
             path: Default::default(),
             quant: Default::default(),
+            turbo: true,
             token_chunk_size: 32,
             head_chunk_size: 8192,
             max_runtime_batch: 8,

@@ -8,6 +8,7 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt};
 use itertools::Itertools;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -92,10 +93,12 @@ impl From<ChatRequest> for GenerateRequest {
             ..
         } = value;
 
+        let re = Regex::new(r"\n(\s*\n)+").unwrap();
         let prompt = Vec::from(messages.clone())
             .into_iter()
             .map(|ChatRecord { role, content }| {
                 let role = names.get(&role).cloned().unwrap_or(role.to_string());
+                let content = re.replace_all(&content, "\n");
                 let content = content.trim();
                 format!("{role}: {content}")
             })
@@ -106,7 +109,11 @@ impl From<ChatRequest> for GenerateRequest {
             .map(|record| record.content)
             .join("\n\n");
 
-        let assistant = Role::Assistant.to_string();
+        let assistant = Role::Assistant;
+        let assistant = names
+            .get(&assistant)
+            .cloned()
+            .unwrap_or(assistant.to_string());
         let prompt = prompt + &format!("\n\n{assistant}:");
 
         let max_tokens = max_tokens.min(crate::MAX_TOKENS);

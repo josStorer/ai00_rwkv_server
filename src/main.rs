@@ -1,14 +1,4 @@
-use std::{
-    env,
-    collections::HashMap,
-    convert::Infallible,
-    fs::{File},
-    io::{BufReader, Read},
-    net::{Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
-    time::Duration,
-};
+use std::{collections::HashMap, convert::Infallible, env, fs::File, io::{BufReader, Read}, net::{Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, sync::{Arc, Mutex, RwLock}, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -16,23 +6,24 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use config::{AdapterOption};
+use config::AdapterOption;
 use flume::{Receiver, Sender};
 use itertools::Itertools;
 use memmap::Mmap;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use run::RuntimeUntyped;
 use serde::{Deserialize, Serialize};
-use tower_http::{cors::CorsLayer};
+use tower_http::cors::CorsLayer;
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
     model::{
-        loader::Loader, FromBuilder, LayerFlags, Lora, LoraBlend, Model, ModelBuilder, ModelInfo,
-        ModelState, ModelVersion, Quantization, StateBuilder,
+        loader::Loader, FromBuilder, Lora, LoraBlend, Model, ModelBuilder, ModelInfo,
+        ModelState, ModelVersion, StateBuilder,
     },
     tokenizer::Tokenizer,
     wgpu::{Backends, PowerPreference},
 };
+use web_rwkv::model::Quant;
 
 use crate::{
     run::{GenerateContext, Runtime, SlotResult, Tokens},
@@ -82,8 +73,8 @@ pub enum Array<T> {
 }
 
 impl<T> From<Array<T>> for Vec<T>
-    where
-        T: std::fmt::Debug + Clone + Serialize,
+where
+    T: std::fmt::Debug + Clone + Serialize,
 {
     fn from(value: Array<T>) -> Self {
         match value {
@@ -103,7 +94,10 @@ pub enum ThreadRequest {
         tokenizer: Arc<Tokenizer>,
         sender: Sender<Token>,
     },
-    Reload(ReloadRequest),
+    Reload {
+        request: ReloadRequest,
+        sender: Option<Sender<bool>>,
+    },
     Unload,
 }
 
@@ -154,6 +148,8 @@ pub struct ReloadRequest {
     pub lora: Vec<config::Lora>,
     /// Specify layers that needs to be quantized.
     pub strategy: String,
+    /// Whether to use alternative GEMM kernel to speed-up long prompts.
+    pub turbo: bool,
     /// Maximum tokens to be processed in parallel at once.
     pub token_chunk_size: usize,
     /// The chunk size for each split of the head matrix.
@@ -176,6 +172,7 @@ impl Default for ReloadRequest {
             model: Default::default(),
             lora: Default::default(),
             strategy: Default::default(),
+            turbo: true,
             token_chunk_size: 32,
             head_chunk_size: 8192,
             max_runtime_batch: 8,
@@ -223,7 +220,6 @@ async fn create_context(adapter: AdapterOption) -> Result<Context> {
 
     let context = ContextBuilder::new(adapter)
         .with_default_pipelines()
-        .with_quant_pipelines()
         .build()
         .await?;
     Ok(context)
@@ -238,22 +234,27 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
 }
 
 fn load_model<'a, M, S>(context: &Context, request: ReloadRequest, data: &'a [u8]) -> Result<(M, S)>
-    where
-        S: ModelState + FromBuilder<Builder<'a>=StateBuilder, Error=Infallible>,
-        M: Model<ModelState=S> + FromBuilder<Builder<'a>=ModelBuilder<'a>, Error=anyhow::Error>,
+where
+    S: ModelState + FromBuilder<Builder<'a> = StateBuilder, Error = Infallible>,
+    M: Model<ModelState = S> + FromBuilder<Builder<'a> = ModelBuilder<'a>, Error = anyhow::Error>,
 {
     let ReloadRequest {
         strategy,
         lora,
         token_chunk_size,
         head_chunk_size,
+        turbo,
         ..
     } = request;
-    let quant = if strategy.contains("i8") {
-        Quantization::Int8(LayerFlags::from_bits_retain((1 << 63) - 1))
+    let quant_type = if strategy.contains("i8") {
+        Quant::Int8
+    } else if strategy.contains("i4") {
+        Quant::NF4
     } else {
-        Quantization::None
+        Quant::None
     };
+
+    let quant =(0..28).map(|layer| (layer, quant_type)).collect();
 
     let lora: Vec<Lora> = lora
         .into_iter()
@@ -267,6 +268,7 @@ fn load_model<'a, M, S>(context: &Context, request: ReloadRequest, data: &'a [u8
 
     let model = ModelBuilder::new(context, data)
         .with_quant(quant)
+        .with_turbo(turbo)
         .with_token_chunk_size(token_chunk_size)
         .with_head_chunk_size(head_chunk_size);
     let model: M = lora
@@ -385,14 +387,24 @@ fn model_route(receiver: Receiver<ThreadRequest>, pool: ThreadPool) -> Result<()
                         });
                     }
                 }
-                ThreadRequest::Reload(request) => {
-                    unload();
-                    let reload = move || {
-                        log::info!("{:#?}", request);
-                        if let Err(err) = reload(request) {
-                            log::error!("reload model failed: {}", err);
+                ThreadRequest::Reload { request, sender } => {
+                    let send_result = move |result: bool| {
+                        if let Some(sender) = sender {
+                            let _ = sender.send(result);
                         }
                     };
+                    let reload = move || {
+                        log::info!("{:#?}", request);
+                        match reload(request) {
+                            Ok(_) => send_result(true),
+                            Err(err) => {
+                                send_result(false);
+                                log::error!("reload model failed: {}", err);
+                            }
+                        }
+                    };
+
+                    unload();
                     pool.spawn(reload);
                 }
                 ThreadRequest::Unload => {
@@ -506,7 +518,6 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root::read_root))
         .route("/exit", post(root::exit))
-        .route("/adapters", get(api::adapters))
         .route("/switch-model", post(api::load))
         .route("/unload-model", get(api::unload))
         .route("/models", get(oai::models))
