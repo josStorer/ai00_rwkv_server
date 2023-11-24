@@ -47,7 +47,8 @@ pub struct ChatRecord {
 #[serde(default)]
 pub struct ChatRequest {
     messages: Array<ChatRecord>,
-    names: HashMap<Role, String>,
+    user_name: String,
+    assistant_name: String,
     max_tokens: usize,
     stop: Array<String>,
     stream: bool,
@@ -63,7 +64,8 @@ impl Default for ChatRequest {
     fn default() -> Self {
         Self {
             messages: Array::default(),
-            names: HashMap::new(),
+            user_name: "User".into(),
+            assistant_name: "Assistant".into(),
             max_tokens: 1024,
             stop: Array::Item("\n\n".into()),
             stream: false,
@@ -81,7 +83,8 @@ impl From<ChatRequest> for GenerateRequest {
     fn from(value: ChatRequest) -> Self {
         let ChatRequest {
             messages,
-            names,
+            user_name,
+            assistant_name,
             max_tokens,
             stop,
             temperature,
@@ -97,7 +100,11 @@ impl From<ChatRequest> for GenerateRequest {
         let prompt = Vec::from(messages.clone())
             .into_iter()
             .map(|ChatRecord { role, content }| {
-                let role = names.get(&role).cloned().unwrap_or(role.to_string());
+                let role = match role {
+                    Role::System => "System",
+                    Role::User => &user_name,
+                    Role::Assistant => &assistant_name,
+                };
                 let content = re.replace_all(&content, "\n");
                 let content = content.trim();
                 format!("{role}: {content}")
@@ -109,11 +116,7 @@ impl From<ChatRequest> for GenerateRequest {
             .map(|record| record.content)
             .join("\n\n");
 
-        let assistant = Role::Assistant;
-        let assistant = names
-            .get(&assistant)
-            .cloned()
-            .unwrap_or(assistant.to_string());
+        let assistant = &assistant_name;
         let prompt = prompt + &format!("\n\n{assistant}:");
 
         let max_tokens = max_tokens.min(crate::MAX_TOKENS);
