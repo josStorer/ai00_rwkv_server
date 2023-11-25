@@ -3,7 +3,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     convert::Infallible,
-    sync::{Arc, Mutex, RwLock},
+    sync::Arc,
     time::Instant,
 };
 
@@ -14,8 +14,9 @@ use qp_trie::Trie;
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
+use tokio::sync::{Mutex, RwLock};
 use web_rwkv::{
-    model::{v4, v5, BackedState, FromBuilder, Model, ModelInfo, ModelState, StateBuilder},
+    model::{v4, v5, v6, BackedState, FromBuilder, Model, ModelInfo, ModelState, StateBuilder},
     tokenizer::Tokenizer,
 };
 
@@ -78,7 +79,7 @@ impl std::cmp::PartialOrd for SlotChoice {
 }
 
 #[derive(Debug, Default)]
-enum Payload {
+pub enum Payload {
     #[default]
     Empty,
     Busy(Box<GenerateContext>),
@@ -87,7 +88,7 @@ enum Payload {
 
 impl Payload {
     /// Takes out the value if `self` is [`Payload::Done`], and reset `self` to [`Payload::Empty`].
-    fn take(&mut self) -> Option<Box<GenerateContext>> {
+    pub fn take(&mut self) -> Option<Box<GenerateContext>> {
         match std::mem::take(self) {
             Payload::Done(context) => Some(context),
             payload => {
@@ -98,14 +99,14 @@ impl Payload {
     }
 
     /// Set `self` to [`Payload::Done`] if `self` is [`Payload::Busy`].
-    fn finalize(&mut self) {
+    pub fn finalize(&mut self) {
         *self = match std::mem::take(self) {
             Payload::Busy(context) => Payload::Done(context),
             payload => payload,
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
 }
@@ -208,27 +209,28 @@ pub struct GenerateContext {
     pub sender: Sender<Token>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Runtime<M, S, B>
-where
-    B: BackedState,
-    S: ModelState<BackedState = B>,
-    M: Model<ModelState = S>,
+    where
+        B: BackedState,
+        S: ModelState<BackedState=B>,
+        M: Model<ModelState=S>,
 {
     tokenizer: Arc<Tokenizer>,
-    model: M,
-    state: S,
-    slots: Mutex<Vec<SlotState>>,
-    backed: Mutex<Trie<Tokens, B>>,
+    model: Arc<M>,
+    state: Arc<S>,
+    slots: Arc<Mutex<Vec<SlotState>>>,
+    backed: Arc<Mutex<Trie<Tokens, B>>>,
     max_runtime_batch: usize,
     embed_layer: usize,
     penalty_free_tokens: HashSet<u16>,
 }
 
 impl<M, S, B> Runtime<M, S, B>
-where
-    for<'a> B: BackedState + Clone + FromBuilder<Builder<'a> = StateBuilder, Error = Infallible>,
-    S: ModelState<BackedState = B>,
-    M: Model<ModelState = S>,
+    where
+            for<'a> B: BackedState + Clone + FromBuilder<Builder<'a>=StateBuilder, Error=Infallible>,
+            S: ModelState<BackedState=B>,
+            M: Model<ModelState=S>,
 {
     pub fn new(
         tokenizer: Tokenizer,
@@ -238,6 +240,9 @@ where
         embed_layer: usize,
     ) -> Self {
         let tokenizer = Arc::new(tokenizer);
+        let model = Arc::new(model);
+        let state = Arc::new(state);
+
         let slots = (0..state.max_batch())
             .map(|_| SlotState::default())
             .collect();
@@ -253,8 +258,8 @@ where
             tokenizer,
             model,
             state,
-            slots: Mutex::new(slots),
-            backed: Mutex::new(Trie::new()),
+            slots: Arc::new(Mutex::new(slots)),
+            backed: Arc::new(Mutex::new(Trie::new())),
             max_runtime_batch,
             embed_layer,
             penalty_free_tokens,
@@ -270,9 +275,9 @@ where
     }
 
     /// Queue an inference task.
-    pub fn queue(&self, context: GenerateContext) -> SlotResult {
-        let mut slots = self.slots.lock().unwrap();
-        let mut cache = self.backed.lock().unwrap();
+    pub async fn queue(&self, context: GenerateContext) -> SlotResult {
+        let mut slots = self.slots.lock().await;
+        let mut cache = self.backed.lock().await;
 
         // we must ensure that there is at least one token as the suffix, otherwise the whole slot will loop forever as there is no input
         let (last, tokens) = match [context.prefix, context.suffix].concat().split_last() {
@@ -329,7 +334,7 @@ where
                     suffix: Tokens([tokens, vec![last]].concat()),
                     ..context
                 }
-                .into(),
+                    .into(),
             ),
             Some((SlotChoice::Back(batch), _)) => {
                 log::info!("start at non-empty slot {}", batch);
@@ -343,13 +348,13 @@ where
                         suffix: Tokens(tokens[len..].to_vec()),
                         ..context
                     }
-                    .into(),
+                        .into(),
                 );
 
                 std::mem::swap(&mut state, &mut slots[batch]);
                 match state {
                     SlotState::Idle(content, _) => {
-                        let backed = self.state.back_batch(batch).expect("back state");
+                        let backed = self.state.back_batch(batch).await.expect("back state");
                         cache.insert(content, backed);
                         self.state.load_batch(&reload, batch).expect("load state");
                         SlotResult::Fault(batch)
@@ -369,7 +374,7 @@ where
                         suffix: Tokens(tokens[len..].to_vec()),
                         ..context
                     }
-                    .into(),
+                        .into(),
                 );
                 slots[batch] = state;
 
@@ -385,7 +390,7 @@ where
                         suffix: Tokens(tokens[len..].to_vec()),
                         ..context
                     }
-                    .into(),
+                        .into(),
                 );
                 slots[batch] = state;
                 SlotResult::Success(batch)
@@ -393,38 +398,41 @@ where
         }
     }
 
-    fn process(&self, payloads: &mut Vec<Payload>) -> Result<()> {
+    pub async fn process(&self, payloads: &mut Vec<Payload>) -> Result<()> {
         {
-            let mut slots = self.slots.lock().unwrap();
-            let mut cache = self.backed.lock().unwrap();
+            let mut slots = self.slots.lock().await;
+            let mut cache = self.backed.lock().await;
 
             payloads.resize_with(self.state.max_batch(), Default::default);
+            // sync payloads and slots: kill dead payloads
+            for (slot, payload) in slots.iter().zip_eq(payloads.iter_mut()) {
+                if !payload.is_empty() && !matches!(slot, SlotState::Busy) {
+                    *payload = Payload::Empty;
+                }
+            }
 
             // reset all finished slots to idle
-            payloads
-                .iter_mut()
-                .enumerate()
-                .for_each(|(batch, payload)| {
-                    if let Some(context) = payload.take() {
-                        assert!(matches!(slots[batch], SlotState::Busy));
-                        slots[batch] = SlotState::Idle(context.prefix, Instant::now());
+            for (batch, payload) in payloads.iter_mut().enumerate() {
+                if let Some(context) = payload.take() {
+                    assert!(matches!(slots[batch], SlotState::Busy));
+                    slots[batch] = SlotState::Idle(context.prefix, Instant::now());
 
-                        if let Some(backed) = match &slots[batch] {
-                            SlotState::Idle(content, _) => {
-                                log::info!("backed slot {}", batch);
-                                let backed = self.state.back_batch(batch).expect("back state");
-                                cache.insert(content.clone(), backed.clone());
-                                Some(backed)
-                            }
-                            _ => None,
-                        } {
-                            if context.request.embed {
-                                let embed = backed.embed(0, self.embed_layer);
-                                let _ = context.sender.send(Token::Embed(embed));
-                            }
+                    if let Some(backed) = match &slots[batch] {
+                        SlotState::Idle(content, _) => {
+                            log::info!("backed slot {}", batch);
+                            let backed = self.state.back_batch(batch).await.expect("back state");
+                            cache.insert(content.clone(), backed.clone());
+                            Some(backed)
+                        }
+                        _ => None,
+                    } {
+                        if context.request.embed {
+                            let embed = backed.embed(0, self.embed_layer);
+                            let _ = context.sender.send(Token::Embed(embed));
                         }
                     }
-                });
+                }
+            }
 
             // take data from some waiting slots
             let occupancy = payloads
@@ -451,7 +459,7 @@ where
                     _ => unreachable!(),
                 };
             }
-        }
+        };
 
         let mut input_tokens = payloads
             .iter()
@@ -469,7 +477,7 @@ where
         let logits = match occupancy {
             0 => vec![None; payloads.len()],
             _ => loop {
-                let logits = self.model.run(&mut input_tokens, &self.state)?;
+                let logits = self.model.run(&mut input_tokens, &self.state).await?;
                 if logits.iter().any(Option::is_some) {
                     break logits;
                 }
@@ -499,7 +507,7 @@ where
 
         let probs = match occupancy {
             0 => vec![None; payloads.len()],
-            _ => self.model.softmax(logits)?,
+            _ => self.model.softmax(logits).await?,
         };
         let output_tokens = payloads
             .par_iter()
@@ -644,6 +652,7 @@ where
 pub enum RuntimeUntyped<'a> {
     V4(Runtime<v4::Model<'a>, v4::ModelState, v4::BackedState>),
     V5(Runtime<v5::Model<'a>, v5::ModelState, v5::BackedState>),
+    V6(Runtime<v6::Model<'a>, v6::ModelState, v6::BackedState>),
 }
 
 macro_rules! impl_runtime_untyped {
@@ -664,33 +673,31 @@ macro_rules! impl_runtime_untyped {
             }
 
             #[inline]
-            pub fn queue(&self, context: GenerateContext) -> SlotResult {
+            pub async fn queue(&self, context: GenerateContext) -> SlotResult {
                 match self {
-                    $(RuntimeUntyped::$variant(runtime) => runtime.queue(context),)*
+                    $(RuntimeUntyped::$variant(runtime) => runtime.queue(context).await,)*
                 }
             }
 
             #[inline]
-            fn process(&self, payloads: &mut Vec<Payload>) -> Result<()> {
+            pub async fn process(&self, payloads: &mut Vec<Payload>) -> Result<()> {
                 match self {
-                    $(RuntimeUntyped::$variant(runtime) => runtime.process(payloads),)*
+                    $(RuntimeUntyped::$variant(runtime) => runtime.process(payloads).await,)*
                 }
             }
         }
     };
 }
 
-impl_runtime_untyped!(V4, V5);
+impl_runtime_untyped!(V4, V5, V6);
 
-pub fn run(receiver: Receiver<()>, env: Arc<RwLock<Environment>>) {
-    let mut payloads = Vec::new();
-
-    loop {
-        let _ = receiver.recv();
+#[tokio::main]
+pub async fn run(receiver: Receiver<()>, env: Arc<RwLock<Environment<'_>>>) {
+    while let Ok(()) = receiver.recv_async().await {
+        let mut payloads = vec![];
         'run: loop {
-            let env = env.read().unwrap();
-            if let Environment::Loaded { runtime, .. } = &*env {
-                if let Err(err) = runtime.process(&mut payloads) {
+            if let Environment::Loaded { runtime, .. } = &*env.read().await {
+                if let Err(err) = runtime.process(&mut payloads).await {
                     log::error!("{}", err);
                 }
             }

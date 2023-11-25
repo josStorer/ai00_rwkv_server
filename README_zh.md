@@ -1,20 +1,20 @@
 # 💯AI00 Server
 <p align='center'>
-<image src="docs/ai00.gif" />
+<image src="img/ai00.gif" />
 </p>
- 
+
 <div align="center"> 
-    
+
 ![license](https://shields.io/badge/license-MIT%2FApache--2.0-blue)
 [![Rust Version](https://img.shields.io/badge/Rust-1.65.0+-blue)](https://releases.rs/docs/1.65.0)
-![PRs welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)     
+![PRs welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
 [![All Contributors](https://img.shields.io/badge/all_contributors-5-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 
 
-[English](README.md) | [中文](README_zh.md) 
+[English](README.md) | [中文](README_zh.md)
 
 <div align="left"> 
  
@@ -41,7 +41,7 @@
 
 ### ⭕模型下载和转换
 
-You must [download the model](https://huggingface.co/BlinkDL) and put in assets/models before running if you are building from source. 
+You must [download the model](https://huggingface.co/BlinkDL) and put in assets/models before running if you are building from source.
 You may download the official RWKV World series models from HuggingFace, and convert them via the provided `convert_safetensors.py`.
 
 你可以在这里下载已经转换好的V4 模型： [模型下载](https://huggingface.co/cgisky/RWKV-safetensors-fp16)
@@ -75,24 +75,24 @@ You may download the official RWKV World series models from HuggingFace, and con
     git clone https://github.com/cgisky1980/ai00_rwkv_server.git
     cd ai00_rwkv_server
     ```
-    
+
 
 3. [下载模型](https://huggingface.co/cgisky/RWKV-safetensors-fp16)后把模型放在
-`assets/models/`路径下，例如`assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
+   `assets/models/`路径下，例如`assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
 
 4. 编译
 
     ```bash
     cargo build --release
     ```
-     
+
 
 5. 编译完成后运行
-   
+
     ```bash     
     cargo run --release
     ```
-   
+
 6. 打开浏览器，访问WebUI
    [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
 
@@ -134,8 +134,17 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 
 ## 📙WebUI 截图
 
+### 对话功能
 
+<image src="img/chat.gif" />
 
+### 续写功能
+
+<image src="img/continuation.gif" />
+
+### 写论文功能
+
+<image src="img/paper.gif" />
 
 ## 📝TODO List
 
@@ -167,7 +176,7 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 - 加入我们的 QQ 群
 - 在 GitHub 上提交问题或拉取请求
 - 在我们的网站上留下反馈
-  
+
 我们迫不及待地想与你合作，让这个项目变得更好！希望项目对你有帮助！
 
 ## Thanks
@@ -204,9 +213,9 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 
 - 来自 QQ 群
 
-    ![image](https://github.com/cgisky1980/ai00_rwkv_server/assets/82481660/6e324617-6d0c-49fd-ab1e-fd9cf02df51e)
+  ![image](https://github.com/cgisky1980/ai00_rwkv_server/assets/82481660/6e324617-6d0c-49fd-ab1e-fd9cf02df51e)
 
-- 来自 Github 
+- 来自 Github
 
 - 来自 Discord
 

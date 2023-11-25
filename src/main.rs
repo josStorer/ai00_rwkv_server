@@ -1,4 +1,14 @@
-use std::{collections::HashMap, convert::Infallible, env, fs::File, io::{BufReader, Read}, net::{Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, sync::{Arc, Mutex, RwLock}, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    env,
+    fs::{File},
+    io::{BufReader, Read},
+    net::{Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::{
@@ -6,19 +16,19 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use config::AdapterOption;
+use config::{AdapterOption};
 use flume::{Receiver, Sender};
 use itertools::Itertools;
 use memmap::Mmap;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use run::RuntimeUntyped;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tokio::sync::{Mutex, RwLock};
+use tower_http::{cors::CorsLayer};
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
     model::{
-        loader::Loader, FromBuilder, Lora, LoraBlend, Model, ModelBuilder, ModelInfo,
-        ModelState, ModelVersion, StateBuilder,
+        loader::Loader, FromBuilder, Lora, LoraBlend, Model, ModelBuilder, ModelInfo, ModelState,
+        ModelVersion, StateBuilder,
     },
     tokenizer::Tokenizer,
     wgpu::{Backends, PowerPreference},
@@ -73,8 +83,8 @@ pub enum Array<T> {
 }
 
 impl<T> From<Array<T>> for Vec<T>
-where
-    T: std::fmt::Debug + Clone + Serialize,
+    where
+        T: std::fmt::Debug + Clone + Serialize,
 {
     fn from(value: Array<T>) -> Self {
         match value {
@@ -109,6 +119,25 @@ pub enum Environment<'a> {
     },
     #[default]
     None,
+}
+
+impl Environment<'_> {
+    pub async fn enqueue(&self, context: GenerateContext) -> Vec<GenerateContext> {
+        let mut queue = vec![];
+        match self {
+            Environment::Loaded { runtime, .. } => match runtime.queue(context).await {
+                SlotResult::Success(batch) => log::info!("queued task at slot {batch}"),
+                SlotResult::Fault(batch) => log::info!("swapped task at slot {batch}"),
+                SlotResult::Failure(context) => {
+                    log::info!("failed to queue task");
+                    queue.push(*context);
+                }
+                SlotResult::Error => log::error!("empty task is not queued"),
+            },
+            Environment::None => queue.push(context),
+        };
+        queue
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -234,9 +263,9 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
 }
 
 fn load_model<'a, M, S>(context: &Context, request: ReloadRequest, data: &'a [u8]) -> Result<(M, S)>
-where
-    S: ModelState + FromBuilder<Builder<'a> = StateBuilder, Error = Infallible>,
-    M: Model<ModelState = S> + FromBuilder<Builder<'a> = ModelBuilder<'a>, Error = anyhow::Error>,
+    where
+        S: ModelState + FromBuilder<Builder<'a>=StateBuilder, Error=Infallible>,
+        M: Model<ModelState=S> + FromBuilder<Builder<'a>=ModelBuilder<'a>, Error=anyhow::Error>,
 {
     let ReloadRequest {
         strategy,
@@ -254,7 +283,7 @@ where
         Quant::None
     };
 
-    let quant =(0..28).map(|layer| (layer, quant_type)).collect();
+    let quant = (0..28).map(|layer| (layer, quant_type)).collect();
 
     let lora: Vec<Lora> = lora
         .into_iter()
@@ -283,133 +312,152 @@ where
     Ok((model, state))
 }
 
-fn model_route(receiver: Receiver<ThreadRequest>, pool: ThreadPool) -> Result<()> {
+#[tokio::main]
+async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
     let env: Arc<RwLock<Environment>> = Default::default();
-    let reload_lock: Arc<Mutex<()>> = Default::default();
-
-    let mut queue = Vec::new();
+    let queue: Arc<Mutex<Vec<GenerateContext>>> = Default::default();
 
     let sender = {
         let (sender, receiver) = flume::unbounded();
         let env = env.clone();
-        pool.spawn(move || run::run(receiver, env));
+        tokio::task::spawn_blocking(move || run::run(receiver, env));
         sender
     };
 
-    let enqueue =
-        |queue: &mut Vec<GenerateContext>, context: GenerateContext| match &*env.read().unwrap() {
-            Environment::Loaded { runtime, .. } => match runtime.queue(context) {
-                SlotResult::Success(batch) => log::info!("queued task at slot {batch}"),
-                SlotResult::Fault(batch) => log::info!("swapped task at slot {batch}"),
-                SlotResult::Failure(context) => queue.push(*context),
-                SlotResult::Error => log::error!("empty task is not queued"),
-            },
-            Environment::None => queue.push(context),
-        };
+    let dequeue = {
+        let env = env.clone();
+        let queue = queue.clone();
+        let sender = sender.clone();
+
+        async move {
+            loop {
+                let mut queue = queue.lock().await;
+                let mut temp = vec![];
+                for context in queue.drain(..) {
+                    temp.append(&mut env.read().await.enqueue(context).await);
+                    let _ = sender.send(());
+                }
+                std::mem::swap(&mut *queue, &mut temp);
+                drop(queue);
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    tokio::spawn(dequeue);
 
     loop {
-        let unload = {
-            let env = env.clone();
-            move || {
-                let mut env = env.write().unwrap();
-                *env = Environment::None;
-            }
-        };
-
-        let reload = {
-            let env = env.clone();
-            let reload_lock = reload_lock.clone();
-            let sender = sender.clone();
-            let unload = unload.clone();
-
-            move |request: ReloadRequest| -> Result<()> {
-                let _lock = reload_lock.lock().unwrap();
-                unload();
-
-                let max_runtime_batch = request.max_runtime_batch;
-                let embed_layer = request.embed_layer;
-
-                let context = pollster::block_on(create_context(request.adapter))?;
-                let tokenizer = load_tokenizer(&request.tokenizer_path)?;
-                log::info!("{:#?}", context.adapter.get_info());
-
-                let file = File::open(&request.model)?;
-                let data = unsafe { Mmap::map(&file)? };
-                let info = Loader::info(&data)?;
-                log::info!("{:#?}", info);
-
-                let runtime = match info.version {
-                    ModelVersion::V4 => {
-                        let (model, state) = load_model(&context, request.clone(), &data)?;
-                        RuntimeUntyped::V4(Runtime::new(
-                            tokenizer,
-                            model,
-                            state,
-                            max_runtime_batch,
-                            embed_layer,
-                        ))
-                    }
-                    ModelVersion::V5 => {
-                        let (model, state) = load_model(&context, request.clone(), &data)?;
-                        RuntimeUntyped::V5(Runtime::new(
-                            tokenizer,
-                            model,
-                            state,
-                            max_runtime_batch,
-                            embed_layer,
-                        ))
-                    }
-                };
-
-                let mut env = env.write().unwrap();
-                let reload = request;
-                *env = Environment::Loaded { runtime, reload };
-
-                let _ = sender.send(());
-                Ok(())
-            }
-        };
-
-        let listen = || -> Result<()> {
-            match receiver.recv()? {
+        let listen = async {
+            match receiver.recv_async().await? {
                 ThreadRequest::Adapter(sender) => {
                     let _ = sender.send(list_adapters());
                 }
                 ThreadRequest::Info(sender) => {
-                    if let Environment::Loaded { runtime, reload } = &*env.read().unwrap() {
-                        let reload = reload.clone();
-                        let model = runtime.info().clone();
-                        let tokenizer = runtime.tokenizer();
-                        let _ = sender.send(RuntimeInfo {
-                            reload,
-                            model,
-                            tokenizer,
-                        });
-                    }
+                    let env = env.clone();
+                    let task = async move {
+                        let env = &(*env.read().await);
+                        if let Environment::Loaded { runtime, reload } = env {
+                            let reload = reload.clone();
+                            let model = runtime.info().clone();
+                            let tokenizer = runtime.tokenizer();
+                            let _ = sender.send(RuntimeInfo {
+                                reload,
+                                model,
+                                tokenizer,
+                            });
+                        }
+                    };
+                    tokio::spawn(task);
                 }
-                ThreadRequest::Reload { request, sender } => {
-                    let send_result = move |result: bool| {
-                        if let Some(sender) = sender {
+                ThreadRequest::Reload {
+                    request,
+                    sender: reload_sender,
+                } => {
+                    let notify = move |result: bool| {
+                        if let Some(sender) = reload_sender {
                             let _ = sender.send(result);
                         }
                     };
-                    let reload = move || {
-                        log::info!("{:#?}", request);
-                        match reload(request) {
-                            Ok(_) => send_result(true),
+                    let sender = sender.clone();
+                    let env = env.clone();
+                    let reload = async move {
+                        let sender = sender.clone();
+                        let max_runtime_batch = request.max_runtime_batch;
+                        let embed_layer = request.embed_layer;
+
+                        let mut env = env.write().await;
+                        *env = Environment::None;
+
+                        let context = create_context(request.adapter).await?;
+                        let tokenizer = load_tokenizer(&request.tokenizer_path)?;
+                        log::info!("{:#?}", context.adapter.get_info());
+
+                        let file = File::open(&request.model)?;
+                        let data = unsafe { Mmap::map(&file)? };
+                        let info = Loader::info(&data)?;
+                        log::info!("{:#?}", info);
+
+                        let runtime = match info.version {
+                            ModelVersion::V4 => {
+                                let (model, state) = load_model(&context, request.clone(), &data)?;
+                                RuntimeUntyped::V4(Runtime::new(
+                                    tokenizer,
+                                    model,
+                                    state,
+                                    max_runtime_batch,
+                                    embed_layer,
+                                ))
+                            }
+                            ModelVersion::V5 => {
+                                let (model, state) = load_model(&context, request.clone(), &data)?;
+                                RuntimeUntyped::V5(Runtime::new(
+                                    tokenizer,
+                                    model,
+                                    state,
+                                    max_runtime_batch,
+                                    embed_layer,
+                                ))
+                            }
+                            ModelVersion::V6 => {
+                                let (model, state) = load_model(&context, request.clone(), &data)?;
+                                RuntimeUntyped::V6(Runtime::new(
+                                    tokenizer,
+                                    model,
+                                    state,
+                                    max_runtime_batch,
+                                    embed_layer,
+                                ))
+                            }
+                        };
+                        let reload = request;
+                        *env = Environment::Loaded { runtime, reload };
+
+                        let _ = sender.send(());
+                        anyhow::Ok(())
+                    };
+
+                    let reload = async move {
+                        match reload.await {
+                            Ok(_) => {
+                                notify(true);
+                                log::info!("model reloaded")
+                            }
                             Err(err) => {
-                                send_result(false);
+                                notify(false);
                                 log::error!("reload model failed: {}", err);
                             }
                         }
                     };
-
-                    unload();
-                    pool.spawn(reload);
+                    tokio::spawn(reload);
                 }
                 ThreadRequest::Unload => {
-                    unload();
-                    log::info!("model unloaded");
+                    let env = env.clone();
+                    let unload = async move {
+                        let mut env = env.write().await;
+                        *env = Environment::None;
+                        log::info!("model unloaded");
+                    };
+                    tokio::spawn(unload);
                 }
                 ThreadRequest::Generate {
                     request,
@@ -439,25 +487,23 @@ fn model_route(receiver: Receiver<ThreadRequest>, pool: ThreadPool) -> Result<()
                         request,
                         sender: token_sender,
                     };
-                    enqueue(&mut queue, context);
-                    let _ = sender.send(());
+
+                    let env = env.clone();
+                    let queue = queue.clone();
+                    let sender = sender.clone();
+                    let task = async move {
+                        let mut queue = queue.lock().await;
+                        queue.append(&mut env.read().await.enqueue(context).await);
+                        let _ = sender.send(());
+                    };
+                    tokio::spawn(task);
                 }
             };
-            Ok(())
+            anyhow::Ok(())
         };
 
-        if let Err(err) = listen() {
+        if let Err(err) = listen.await {
             log::error!("{err}");
-        }
-
-        while !queue.is_empty() {
-            let mut temp = Vec::new();
-            for context in queue.drain(..) {
-                enqueue(&mut temp, context);
-                let _ = sender.send(());
-            }
-            std::mem::swap(&mut queue, &mut temp);
-            std::thread::sleep(Duration::from_secs(1));
         }
     }
 }
@@ -500,8 +546,6 @@ struct Args {
     ip: Option<Ipv4Addr>,
     #[arg(long, short, default_value_t = 8000)]
     port: u16,
-    #[arg(long, short, default_value_t = 0)]
-    threads: usize,
 }
 
 #[tokio::main]
@@ -535,10 +579,6 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     log::info!("server started at http://{addr}");
 
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build()
-        .unwrap();
-    std::thread::spawn(move || model_route(receiver, pool));
+    tokio::task::spawn_blocking(move || model_route(receiver));
     axum::serve(listener, app).await.unwrap();
 }
