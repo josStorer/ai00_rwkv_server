@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    convert::Infallible,
     env,
     fs::{File},
     io::{BufReader, Read},
@@ -19,7 +18,7 @@ use clap::Parser;
 use config::{AdapterOption};
 use flume::{Receiver, Sender};
 use itertools::Itertools;
-use memmap::Mmap;
+use memmap2::Mmap;
 use run::RuntimeUntyped;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -27,7 +26,7 @@ use tower_http::{cors::CorsLayer};
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
     model::{
-        loader::Loader, FromBuilder, Lora, LoraBlend, Model, ModelBuilder, ModelInfo, ModelState,
+        loader::Loader, Lora, LoraBlend, Model, ModelBuilder, ModelInfo, ModelState,
         ModelVersion, StateBuilder,
     },
     tokenizer::Tokenizer,
@@ -45,6 +44,7 @@ mod config;
 mod oai;
 mod run;
 mod sampler;
+mod utils;
 mod root;
 
 pub const MAX_TOKENS: usize = 4096;
@@ -238,7 +238,7 @@ fn list_adapters() -> AdapterList {
     AdapterList(list)
 }
 
-async fn create_context(adapter: AdapterOption) -> Result<Context> {
+async fn create_context(adapter: AdapterOption, info: &ModelInfo) -> Result<Context> {
     let backends = Backends::VULKAN | Backends::METAL;
     let instance = Instance::new();
     let adapter = match adapter {
@@ -247,8 +247,13 @@ async fn create_context(adapter: AdapterOption) -> Result<Context> {
         AdapterOption::Manual(selection) => instance.select_adapter(backends, selection),
     }?;
 
+    let limits = web_rwkv::wgpu::Limits {
+        max_storage_buffer_binding_size: info.max_buffer_size() as u32,
+        ..Default::default()
+    };
     let context = ContextBuilder::new(adapter)
         .with_default_pipelines()
+        .with_limits(limits)
         .build()
         .await?;
     Ok(context)
@@ -262,16 +267,15 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
     Ok(Tokenizer::new(&contents)?)
 }
 
-fn load_model<'a, M, S>(context: &Context, request: ReloadRequest, data: &'a [u8]) -> Result<(M, S)>
+fn load_model<M, S>(context: &Context, request: ReloadRequest, data: &[u8]) -> Result<(M, S)>
     where
-        S: ModelState + FromBuilder<Builder<'a>=StateBuilder, Error=Infallible>,
-        M: Model<ModelState=S> + FromBuilder<Builder<'a>=ModelBuilder<'a>, Error=anyhow::Error>,
+        S: ModelState,
+        M: Model<ModelState = S>,
 {
     let ReloadRequest {
         strategy,
         lora,
         token_chunk_size,
-        head_chunk_size,
         turbo,
         ..
     } = request;
@@ -303,8 +307,7 @@ fn load_model<'a, M, S>(context: &Context, request: ReloadRequest, data: &'a [u8
     let model = ModelBuilder::new(context, data)
         .with_quant(quant)
         .with_turbo(turbo)
-        .with_token_chunk_size(token_chunk_size)
-        .with_head_chunk_size(head_chunk_size);
+        .with_token_chunk_size(token_chunk_size);
     let model: M = lora
         .into_iter()
         .fold(model, |acc, x| acc.add_lora(x))
@@ -390,17 +393,17 @@ async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                         let max_runtime_batch = request.max_runtime_batch;
                         let embed_layer = request.embed_layer;
 
-                        let mut env = env.write().await;
-                        *env = Environment::None;
-
-                        let context = create_context(request.adapter).await?;
-                        let tokenizer = load_tokenizer(&request.tokenizer_path)?;
-                        log::info!("{:#?}", context.adapter.get_info());
-
                         let file = File::open(&request.model)?;
                         let data = unsafe { Mmap::map(&file)? };
                         let info = Loader::info(&data)?;
                         log::info!("{:#?}", info);
+
+                        let context = create_context(request.adapter, &info).await?;
+                        let tokenizer = load_tokenizer(&request.tokenizer_path)?;
+                        log::info!("{:#?}", context.adapter.get_info());
+
+                        let mut env = env.write().await;
+                        *env = Environment::None;
 
                         let runtime = match info.version {
                             ModelVersion::V4 => {
@@ -563,6 +566,7 @@ async fn main() {
 
     let args = Args::parse();
     let (sender, receiver) = flume::unbounded::<ThreadRequest>();
+    tokio::task::spawn_blocking(move || model_route(receiver));
 
     let app = Router::new()
         .route("/", get(root::read_root))
@@ -582,8 +586,6 @@ async fn main() {
 
     let addr = SocketAddr::from((args.ip.unwrap_or(Ipv4Addr::new(0, 0, 0, 0)), args.port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    log::info!("server started at http://{addr}");
-
-    tokio::task::spawn_blocking(move || model_route(receiver));
+    log::info!("server started at {addr}");
     axum::serve(listener, app).await.unwrap();
 }

@@ -14,6 +14,10 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+assets/frpc/
+assets/unzip/
+assets/temp/
+
 *.st
 *.exe
 qdrant/
@@ -22,4 +26,5 @@ run.bat
 node_modules/
 docs/.vitepress/dist
 docs/.vitepress/cache
+nohup.out
 .vscode/

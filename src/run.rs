@@ -61,6 +61,7 @@ enum SlotChoice {
 
 impl std::cmp::Ord for SlotChoice {
     fn cmp(&self, other: &Self) -> Ordering {
+        // priority: continue > empty > back
         use SlotChoice::{Back, Continue, Empty};
         match (self, other) {
             (Continue(_, x), Continue(_, y)) => x.cmp(y),

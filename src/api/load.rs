@@ -1,13 +1,14 @@
 use axum::{
     extract::State,
+    http::StatusCode,
     Json,
 };
 use serde::Serialize;
 use web_rwkv::model::ModelInfo;
 
 use crate::{
-    try_request_info, ReloadRequest, ThreadRequest,
-    ThreadState,
+    utils::{try_request_info},
+    ReloadRequest, ThreadRequest, ThreadState,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -16,38 +17,25 @@ pub struct InfoResponse {
     model: ModelInfo,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum LoadResponse {
-    Ok,
-    Err,
-}
-
 /// `/api/models/load`.
 pub async fn load(
     State(ThreadState(sender)): State<ThreadState>,
     Json(request): Json<ReloadRequest>,
-) -> Json<LoadResponse> {
+) -> StatusCode {
     let (result_sender, result_receiver) = flume::unbounded();
     let _ = sender.send(ThreadRequest::Reload {
         request,
         sender: Some(result_sender),
     });
     match result_receiver.recv_async().await.unwrap() {
-        true => Json(LoadResponse::Ok),
-        false => Json(LoadResponse::Err),
+        true => StatusCode::OK,
+        false => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum UnloadResponse {
-    Ok,
-}
-
 /// `/api/models/unload`.
-pub async fn unload(State(ThreadState(sender)): State<ThreadState>) -> Json<UnloadResponse> {
+pub async fn unload(State(ThreadState(sender)): State<ThreadState>) -> StatusCode {
     let _ = sender.send(ThreadRequest::Unload);
     while try_request_info(sender.clone()).await.is_ok() {}
-    Json(UnloadResponse::Ok)
+    StatusCode::OK
 }
