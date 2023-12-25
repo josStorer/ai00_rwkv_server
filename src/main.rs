@@ -283,7 +283,12 @@ fn load_model<'a, M, S>(context: &Context, request: ReloadRequest, data: &'a [u8
         Quant::None
     };
 
-    let quant = (0..28).map(|layer| (layer, quant_type)).collect();
+    let layer = strategy
+        .split_whitespace()
+        .flat_map(|s| s.split(','))
+        .find_map(|s| s.strip_prefix("layer").and_then(|n| n.parse::<usize>().ok()))
+        .unwrap_or(26);
+    let quant = (0..layer).map(|layer| (layer, quant_type)).collect();
 
     let lora: Vec<Lora> = lora
         .into_iter()
