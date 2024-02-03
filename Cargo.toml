@@ -1,6 +1,6 @@
 [package]
 name = "ai00_server"
-version = "0.3.8"
+version = "0.3.13"
 edition = "2021"
 authors = ["Gu ZhenNiu <448885@qq.com>", "Zhang Zhenyuan <cryscan@umich.edu>"]
 license = "MIT OR Apache-2.0"
@@ -10,12 +10,13 @@ repository = "https://github.com/cgisky1980/ai00_rwkv_server"
 keywords = ["deep-learning", "LLM", "model", "rwkv"]
 categories = ["science"]
 exclude = ["assets"]
+rust-version = "1.75"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# web-rwkv = "0.4.7"
-web-rwkv = { git = "https://github.com/cryscan/web-rwkv", tag = "v0.4.8" }
+web-rwkv = "0.6.0"
+# web-rwkv = { git = "https://github.com/cryscan/web-rwkv", tag = "v0.5.0" }
 tower = { version = "0.4.13", features = ["full"] }
 tower-http = { version = "0.5.0", features = ["full"] }
 tokio = { version = "1", features = ["full"] }

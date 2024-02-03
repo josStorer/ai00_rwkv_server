@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ai00_server"
-version = "0.3.8"
+version = "0.3.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -859,6 +859,12 @@ checksum = "6c8098adac955faa2d31079b65dc48841251f69efd3ac25477903fc424362ead"
 dependencies = [
  "gl_generator",
 ]
+
+[[package]]
+name = "gpp"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "083168a3a8cdb2a7d48be1e1bcc25bd63dd72e5fa89aa9c6506c1a78e083aa6d"
 
 [[package]]
 name = "gpu-alloc"
@@ -2337,16 +2343,17 @@ checksum = "7ab9b36309365056cd639da3134bf87fa8f3d86008abf99e612384a6eecd459f"
 
 [[package]]
 name = "web-rwkv"
-version = "0.4.8"
-source = "git+https://github.com/cryscan/web-rwkv?tag=v0.4.8#4e0b166e586fc6491dd942d17fbcc1b5ffcb0218"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4f0e943d7024b97ea605c68f3f1722c88c52017b01bcfe6f3b6d8f13424f58e"
 dependencies = [
  "ahash",
  "anyhow",
- "async-trait",
  "bitflags 2.4.1",
  "bytemuck",
  "derive-getters",
  "flume",
+ "gpp",
  "half",
  "itertools",
  "lazy_static",
@@ -2363,7 +2370,8 @@ dependencies = [
 [[package]]
 name = "web-rwkv-derive"
 version = "0.2.0"
-source = "git+https://github.com/cryscan/web-rwkv?tag=v0.4.8#4e0b166e586fc6491dd942d17fbcc1b5ffcb0218"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7853e68f05577afc0c66b73191fb2f11c5177d273e0017270ffb3df1f135325f"
 dependencies = [
  "quote",
  "syn 2.0.39",

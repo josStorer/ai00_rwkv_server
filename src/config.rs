@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use web_rwkv::model::{EmbedDevice};
 
 use crate::ReloadRequest;
 
@@ -11,27 +12,30 @@ pub struct Config {
     pub lora: Vec<Lora>,
     pub tokenizer: Tokenizer,
     pub adapter: AdapterOption,
+    pub setting: Setting,
 }
 
 impl From<Config> for ReloadRequest {
     fn from(value: Config) -> Self {
         let Config {
             model:
-                Model {
-                    path: model_path,
-                    quant:_,
-                    turbo,
-                    token_chunk_size,
-                    head_chunk_size,
-                    max_runtime_batch,
-                    max_batch,
-                    embed_layer,
-                },
+            Model {
+                path: model_path,
+                quant: _,
+                turbo,
+                token_chunk_size,
+                head_chunk_size,
+                max_runtime_batch,
+                max_batch,
+                embed_layer,
+                embed_device
+            },
             lora,
             tokenizer: Tokenizer {
                 path: tokenizer_path,
             },
             adapter,
+            ..
         } = value;
         Self {
             model: model_path,
@@ -43,6 +47,7 @@ impl From<Config> for ReloadRequest {
             max_runtime_batch,
             max_batch,
             embed_layer,
+            embed_device,
             tokenizer_path,
             adapter,
         }
@@ -66,8 +71,10 @@ pub struct Model {
     pub max_runtime_batch: usize,
     /// Number of states that are cached on GPU.
     pub max_batch: usize,
-    /// the (reversed) number of layer at which the output is as embedding.
+    /// The (reversed) number of layer at which the output is as embedding.
     pub embed_layer: usize,
+    /// Device to put the embed tensor.
+    pub embed_device: EmbedDevice,
 }
 
 impl Default for Model {
@@ -81,6 +88,7 @@ impl Default for Model {
             max_runtime_batch: 8,
             max_batch: 16,
             embed_layer: 2,
+            embed_device: Default::default(),
         }
     }
 }
@@ -115,4 +123,11 @@ pub enum AdapterOption {
     Auto,
     Economical,
     Manual(usize),
+}
+
+/// More inference configurations.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Setting {
+    /// Additional stop words.
+    pub stop: Vec<String>,
 }

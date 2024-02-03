@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{File},
     io::{BufReader, Read},
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -15,7 +15,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use config::{AdapterOption};
+use config::{AdapterOption, Setting};
 use flume::{Receiver, Sender};
 use itertools::Itertools;
 use memmap2::Mmap;
@@ -26,13 +26,12 @@ use tower_http::{cors::CorsLayer};
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
     model::{
-        loader::Loader, Lora, LoraBlend, Model, ModelBuilder, ModelInfo, ModelState,
-        ModelVersion, StateBuilder,
+        loader::Loader, EmbedDevice, Lora, LoraBlend, Model, ModelBuilder, ModelInfo, ModelState,
+        ModelVersion, Quant, StateBuilder,
     },
     tokenizer::Tokenizer,
     wgpu::{Backends, PowerPreference},
 };
-use web_rwkv::model::Quant;
 
 use crate::{
     run::{GenerateContext, Runtime, SlotResult, Tokens},
@@ -187,8 +186,10 @@ pub struct ReloadRequest {
     pub max_runtime_batch: usize,
     /// Number of states that are cached on GPU.
     pub max_batch: usize,
-    /// the (reversed) number of layer at which the output is as embedding.
+    /// The (reversed) number of layer at which the output is as embedding.
     pub embed_layer: usize,
+    /// Device to put the embed tensor.
+    pub embed_device: EmbedDevice,
     /// Path to the tokenizer.
     pub tokenizer_path: PathBuf,
     /// Adapter selection.
@@ -213,6 +214,7 @@ impl Default for ReloadRequest {
                 .unwrap()
                 .join("assets/rwkv_vocab_v20230424.json"),
             adapter: AdapterOption::Auto,
+            embed_device: Default::default(),
         }
     }
 }
@@ -246,14 +248,8 @@ async fn create_context(adapter: AdapterOption, info: &ModelInfo) -> Result<Cont
         AdapterOption::Economical => instance.adapter(PowerPreference::LowPower).await,
         AdapterOption::Manual(selection) => instance.select_adapter(backends, selection),
     }?;
-
-    let limits = web_rwkv::wgpu::Limits {
-        max_storage_buffer_binding_size: info.max_buffer_size() as u32,
-        ..Default::default()
-    };
     let context = ContextBuilder::new(adapter)
-        .with_default_pipelines()
-        .with_limits(limits)
+        .with_auto_limits(info)
         .build()
         .await?;
     Ok(context)
@@ -270,13 +266,14 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
 fn load_model<M, S>(context: &Context, request: ReloadRequest, data: &[u8]) -> Result<(M, S)>
     where
         S: ModelState,
-        M: Model<ModelState = S>,
+        M: Model<State=S>,
 {
     let ReloadRequest {
         strategy,
         lora,
         token_chunk_size,
         turbo,
+        embed_device,
         ..
     } = request;
     let quant_type = if strategy.contains("i8") {
@@ -307,6 +304,7 @@ fn load_model<M, S>(context: &Context, request: ReloadRequest, data: &[u8]) -> R
     let model = ModelBuilder::new(context, data)
         .with_quant(quant)
         .with_turbo(turbo)
+        .with_embed_device(embed_device)
         .with_token_chunk_size(token_chunk_size);
     let model: M = lora
         .into_iter()
@@ -321,14 +319,14 @@ fn load_model<M, S>(context: &Context, request: ReloadRequest, data: &[u8]) -> R
 }
 
 #[tokio::main]
-async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
+async fn model_route(receiver: Receiver<ThreadRequest>, setting: Setting) -> Result<()> {
     let env: Arc<RwLock<Environment>> = Default::default();
     let queue: Arc<Mutex<Vec<GenerateContext>>> = Default::default();
 
     let sender = {
         let (sender, receiver) = flume::unbounded();
         let env = env.clone();
-        tokio::task::spawn_blocking(move || run::run(receiver, env));
+        tokio::task::spawn_blocking(move || run::run(receiver, env, setting));
         sender
     };
 
@@ -356,9 +354,12 @@ async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
 
     loop {
         let listen = async {
-            match receiver.recv_async().await? {
+            match receiver.recv_async().await.unwrap() {
                 ThreadRequest::Adapter(sender) => {
-                    let _ = sender.send(list_adapters());
+                    let task = async move {
+                        let _ = sender.send(list_adapters());
+                    };
+                    tokio::spawn(task);
                 }
                 ThreadRequest::Info(sender) => {
                     let env = env.clone();
@@ -551,7 +552,7 @@ pub async fn request_info_stream(
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long, short)]
-    ip: Option<Ipv4Addr>,
+    ip: Option<IpAddr>,
     #[arg(long, short, default_value_t = 8000)]
     port: u16,
 }
@@ -566,7 +567,7 @@ async fn main() {
 
     let args = Args::parse();
     let (sender, receiver) = flume::unbounded::<ThreadRequest>();
-    tokio::task::spawn_blocking(move || model_route(receiver));
+    tokio::task::spawn_blocking(move || model_route(receiver, Default::default()));
 
     let app = Router::new()
         .route("/", get(root::read_root))
@@ -584,7 +585,10 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(ThreadState(sender));
 
-    let addr = SocketAddr::from((args.ip.unwrap_or(Ipv4Addr::new(0, 0, 0, 0)), args.port));
+    let addr = SocketAddr::new(
+        args.ip.unwrap_or(IpAddr::from(Ipv4Addr::UNSPECIFIED)),
+        args.port,
+    );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     log::info!("server started at {addr}");
     axum::serve(listener, app).await.unwrap();
