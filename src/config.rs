@@ -11,8 +11,7 @@ pub struct Config {
     pub model: Model,
     pub lora: Vec<Lora>,
     pub tokenizer: Tokenizer,
-    pub adapter: AdapterOption,
-    pub setting: Setting,
+    pub adapter: AdapterOption
 }
 
 impl From<Config> for ReloadRequest {
@@ -25,9 +24,9 @@ impl From<Config> for ReloadRequest {
                 turbo,
                 token_chunk_size,
                 head_chunk_size,
+                state_chunk_size,
                 max_runtime_batch,
                 max_batch,
-                embed_layer,
                 embed_device
             },
             lora,
@@ -44,9 +43,9 @@ impl From<Config> for ReloadRequest {
             turbo,
             token_chunk_size,
             head_chunk_size,
+            state_chunk_size,
             max_runtime_batch,
             max_batch,
-            embed_layer,
             embed_device,
             tokenizer_path,
             adapter,
@@ -67,12 +66,12 @@ pub struct Model {
     pub token_chunk_size: usize,
     /// The chunk size for each split of the head matrix.
     pub head_chunk_size: usize,
+    /// The chunk size of layers in model state.
+    pub state_chunk_size: usize,
     /// Maximum number of batches that are active at once.
     pub max_runtime_batch: usize,
     /// Number of states that are cached on GPU.
     pub max_batch: usize,
-    /// The (reversed) number of layer at which the output is as embedding.
-    pub embed_layer: usize,
     /// Device to put the embed tensor.
     pub embed_device: EmbedDevice,
 }
@@ -83,11 +82,11 @@ impl Default for Model {
             path: Default::default(),
             quant: Default::default(),
             turbo: true,
-            token_chunk_size: 32,
+            token_chunk_size: 128,
             head_chunk_size: 8192,
+            state_chunk_size: 4,
             max_runtime_batch: 8,
             max_batch: 16,
-            embed_layer: 2,
             embed_device: Default::default(),
         }
     }
@@ -123,11 +122,4 @@ pub enum AdapterOption {
     Auto,
     Economical,
     Manual(usize),
-}
-
-/// More inference configurations.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Setting {
-    /// Additional stop words.
-    pub stop: Vec<String>,
 }

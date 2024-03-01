@@ -12,14 +12,17 @@ use crate::{
 #[serde(default)]
 pub struct EmbeddingRequest {
     input: Array<String>,
+    embed_layer: usize,
 }
 
 impl From<EmbeddingRequest> for GenerateRequest {
     fn from(value: EmbeddingRequest) -> Self {
+        let EmbeddingRequest { input, embed_layer } = value;
         Self {
-            prompt: Vec::from(value.input).join(""),
+            prompt: Vec::from(input).join(""),
             max_tokens: 1,
             embed: true,
+            embed_layer,
             ..Default::default()
         }
     }
