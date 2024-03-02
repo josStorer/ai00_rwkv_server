@@ -82,7 +82,7 @@ impl Default for Model {
             path: Default::default(),
             quant: Default::default(),
             turbo: true,
-            token_chunk_size: 128,
+            token_chunk_size: 32,
             head_chunk_size: 8192,
             state_chunk_size: 4,
             max_runtime_batch: 8,

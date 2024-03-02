@@ -207,7 +207,7 @@ impl Default for ReloadRequest {
             lora: Default::default(),
             strategy: Default::default(),
             turbo: true,
-            token_chunk_size: 128,
+            token_chunk_size: 32,
             head_chunk_size: 8192,
             state_chunk_size: 4,
             max_runtime_batch: 8,
@@ -296,6 +296,11 @@ async fn load_model<M, S>(context: &Context, request: ReloadRequest) -> Result<(
         .flat_map(|s| s.split(','))
         .find_map(|s| s.strip_prefix("layer").and_then(|n| n.parse::<usize>().ok()))
         .unwrap_or(26);
+    let chunk_size = strategy
+        .split_whitespace()
+        .flat_map(|s| s.split(','))
+        .find_map(|s| s.strip_prefix("chunk").and_then(|n| n.parse::<usize>().ok()))
+        .unwrap_or(token_chunk_size);
     let quant = (0..layer).map(|layer| (layer, quant_type)).collect();
 
     let lora: Vec<_> = lora
@@ -323,7 +328,7 @@ async fn load_model<M, S>(context: &Context, request: ReloadRequest) -> Result<(
         .with_quant(quant)
         .with_turbo(turbo)
         .with_embed_device(embed_device)
-        .with_token_chunk_size(token_chunk_size);
+        .with_token_chunk_size(chunk_size);
     let model: M = lora
         .into_iter()
         .fold(model, |acc, x| acc.add_lora(x))
