@@ -18,6 +18,7 @@ assets/frpc/
 assets/unzip/
 assets/temp/
 
+*.lora
 *.st
 *.pth
 *.exe

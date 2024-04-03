@@ -1,21 +1,22 @@
 use std::{
     borrow::Borrow,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     convert::Infallible,
     future::Future,
+    io::Write,
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use bnf_sampler::{grammar::Grammar, sampler::AcceptTokenResult, vocabulary::Vocabulary};
 use flume::{Receiver, Sender};
 use itertools::Itertools;
 use qp_trie::Trie;
-use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-};
+use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use web_rwkv::{
     model::{
@@ -24,10 +25,16 @@ use web_rwkv::{
     tokenizer::Tokenizer,
 };
 
-use crate::{Environment, FinishReason, GenerateRequest, Token, TokenCounter};
+use crate::{
+    middleware::{Environment, FinishReason, GenerateRequest, ReloadRequest, Token, TokenCounter},
+    sampler::{bnf::BnfSampler, Transformer},
+};
 
 const PENALTY_FREE_LIST: [&str; 5] = ["\n", ",", ".", "\u{002c}", "\u{002f}"];
-pub const PROMPT_CACHE_TOKENS: usize = 32;
+const PROMPT_CACHE_TOKENS: usize = 32;
+const MAX_CACHE_ITEMS: usize = 256;
+const SAMPLER_ARENA_CAPACITY: usize = 1048576;
+const GRAMMAR_ARENA_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
 pub enum SlotResult {
@@ -38,7 +45,7 @@ pub enum SlotResult {
     /// There is no idle slot left.
     Failure(Box<GenerateContext>),
     /// An error occurred.
-    Error,
+    Error(String),
 }
 
 #[derive(Debug)]
@@ -114,8 +121,20 @@ impl Payload {
         }
     }
 
+    /// Returns `true` if the payload is [`Empty`].
+    ///
+    /// [`Empty`]: Payload::Empty
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
+    }
+
+    /// Returns `true` if the payload is [`Busy`].
+    ///
+    /// [`Busy`]: Payload::Busy
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy(..))
     }
 }
 
@@ -205,24 +224,59 @@ pub struct GenerateContext {
     pub prefix: Tokens,
     /// Tokens to be computed.
     pub suffix: Tokens,
-    /// The accumulated penalties for model-output tokens.
-    pub penalties: HashMap<u16, f32>,
     /// Texts that are output by the model.
     pub model_text: Vec<u8>,
     /// Model may output partial utf-8. This makes sure the output is always valid.
     pub buffer: Vec<u8>,
     /// Tokens that are output by the model.
     pub model_tokens: Vec<u16>,
+    /// Compiled BNF schema, if any.
+    pub bnf_sampler: Option<Arc<RwLock<BnfSampler>>>,
     /// Generate request provided by the caller.
     pub request: GenerateRequest,
     /// To send back generated tokens.
     pub sender: Sender<Token>,
 }
 
+#[derive(Debug)]
+struct CachedItem<T> {
+    item: Arc<T>,
+    instant: Instant,
+}
+
+impl<T> CachedItem<T> {
+    pub fn new(backed: T) -> Self {
+        Self {
+            item: Arc::new(backed),
+            instant: Instant::now(),
+        }
+    }
+
+    pub fn renew(cached: CachedItem<T>) -> Self {
+        Self {
+            item: cached.item,
+            instant: Instant::now(),
+        }
+    }
+}
+
+impl<T> Clone for CachedItem<T> {
+    fn clone(&self) -> Self {
+        Self {
+            item: self.item.clone(),
+            instant: self.instant,
+        }
+    }
+}
+
 pub trait Runner {
     fn info(&self) -> &ModelInfo;
     fn num_batch(&self) -> usize;
     fn tokenizer(&self) -> Arc<Tokenizer>;
+    fn reload(&self) -> &ReloadRequest;
+
+    /// Serialize the model into the given path.
+    fn serialize_model(&self, path: PathBuf) -> Result<()>;
 
     /// Queue an inference task.
     fn queue(
@@ -234,40 +288,43 @@ pub trait Runner {
     fn process<'a>(
         &'a self,
         payloads: &'a mut [Payload],
-    ) -> Pin<Box<dyn Future<Output =Result<()>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+    /// Keep the items in the cache less then [`MAX_CACHE_ITEMS`].
+    fn maintain_cache(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[derive(Debug)]
 pub struct Runtime<M, S, B>
-    where
-        B: BackedState,
-        S: ModelState<BackedState = B>,
-        M: Model<State = S>,
-        StateBuilder: Build<B, Error = Infallible>,
+where
+    B: BackedState,
+    S: ModelState<BackedState = B>,
+    M: Model<State = S> + Serialize,
+    StateBuilder: Build<B, Error = Infallible>,
 {
     model: M,
     state: S,
     tokenizer: Arc<Tokenizer>,
+    vocab: Arc<Vocabulary>,
     slots: Mutex<Vec<SlotState>>,
-    backed: Mutex<Trie<Tokens, Arc<B>>>,
-    max_runtime_batch: usize,
-    state_chunk_size: usize,
+    backed: Mutex<Trie<Tokens, CachedItem<B>>>,
+    reload: ReloadRequest,
     _penalty_free_tokens: HashSet<u16>,
 }
 
 impl<M, S, B> Runtime<M, S, B>
-    where
-        B: BackedState,
-        S: ModelState<BackedState = B>,
-        M: Model<State = S>,
-        StateBuilder: Build<B, Error = Infallible>,
+where
+    B: BackedState,
+    S: ModelState<BackedState = B>,
+    M: Model<State = S> + Serialize,
+    StateBuilder: Build<B, Error = Infallible>,
 {
     pub fn new(
         tokenizer: Tokenizer,
+        vocab: Vocabulary,
         model: M,
         state: S,
-        max_runtime_batch: usize,
-        state_chunk_size: usize,
+        reload: ReloadRequest,
     ) -> Self {
         let slots = (0..state.num_batch())
             .map(|_| SlotState::default())
@@ -284,12 +341,36 @@ impl<M, S, B> Runtime<M, S, B>
             model,
             state,
             tokenizer: Arc::new(tokenizer),
+            vocab: Arc::new(vocab),
             slots: Mutex::new(slots),
             backed: Mutex::new(Trie::new()),
-            max_runtime_batch,
-            state_chunk_size,
+            reload,
             _penalty_free_tokens,
         }
+    }
+
+    #[inline]
+    pub fn reload(&self) -> &ReloadRequest {
+        &self.reload
+    }
+
+    fn serialize_model(&self, path: PathBuf) -> Result<()> {
+        use cbor4ii::{core::enc::Write, serde::Serializer};
+        use std::fs::File;
+
+        struct FileWriter(File);
+        impl Write for FileWriter {
+            type Error = std::io::Error;
+            fn push(&mut self, input: &[u8]) -> Result<(), Self::Error> {
+                self.0.write_all(input)
+            }
+        }
+
+        let file = FileWriter(File::create(path)?);
+        let mut serializer = Serializer::new(file);
+        self.model.serialize(&mut serializer)?;
+
+        Ok(())
     }
 
     /// Search for the longest common prefix in the memory cache and checkout the state from that point.
@@ -305,22 +386,36 @@ impl<M, S, B> Runtime<M, S, B>
 
         let prefix = prefix[0..len].to_vec();
         let reload = match cache.remove(prefix[..].as_token_slice()) {
-            Some(reload) => reload,
+            Some(reload) => CachedItem::renew(reload),
             None => {
                 let context = self.model.context();
                 let info = self.model.info();
                 let backed = StateBuilder::new(context, info)
-                    .with_chunk_size(self.state_chunk_size)
+                    .with_chunk_size(self.reload.state_chunk_size)
                     .build()
                     .unwrap();
-                Arc::new(backed)
+                CachedItem::new(backed)
             }
         };
         if len > 0 {
             let key = Tokens(prefix.clone());
             cache.insert(key, reload.clone());
         }
-        (prefix, reload)
+        (prefix, reload.item)
+    }
+
+    /// Compile and cache the given schema into a BNF sampler.
+    async fn compile_bnf_schema(&self, schema: String) -> Result<BnfSampler> {
+        let grammar = Grammar::new(&schema, self.vocab.clone(), GRAMMAR_ARENA_CAPACITY)?;
+        let start_nonterminal = self.reload.bnf.start_nonterminal.clone();
+        let sampler = bnf_sampler::sampler::Sampler::new(
+            grammar,
+            start_nonterminal,
+            self.vocab.clone(),
+            SAMPLER_ARENA_CAPACITY,
+            self.reload.bnf.enable_bytes_cache,
+        )?;
+        Ok(BnfSampler::new(sampler))
     }
 
     /// Queue an inference task.
@@ -330,9 +425,23 @@ impl<M, S, B> Runtime<M, S, B>
         // we must ensure that there is at least one token as the suffix, otherwise the whole slot will loop forever as there is no input
         let (last, tokens) = match [context.prefix, context.suffix].concat().split_last() {
             Some((last, tokens)) => (*last, tokens.to_vec()),
-            None => return SlotResult::Error,
+            None => return SlotResult::Error("empty task is not queued".into()),
         };
 
+        // compile the BNF schema.
+        let bnf_sampler = if let Some(schema) = context.request.bnf_schema.clone() {
+            match self.compile_bnf_schema(schema).await {
+                Ok(bnf_sampler) => Some(Arc::new(RwLock::new(bnf_sampler))),
+                Err(err) => return SlotResult::Error(err.to_string()),
+            }
+        } else {
+            None
+        };
+
+        // find the best idle slot by:
+        // 1. find the slot that matches the context (continue)
+        // 2. find an empty slot
+        // 3. find the oldest non-empty slot
         let choice = slots
             .iter()
             .enumerate()
@@ -350,14 +459,18 @@ impl<M, S, B> Runtime<M, S, B>
             .max_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.1.cmp(&rhs.1)));
 
         match choice {
+            // we cannot find a slot because all slots are occupied
+            // in this case, we hand the request back to the caller
             None => SlotResult::Failure(
                 GenerateContext {
                     prefix: Default::default(),
                     suffix: Tokens([tokens, vec![last]].concat()),
+                    bnf_sampler,
                     ..context
                 }
-                    .into(),
+                .into(),
             ),
+            // back a non-relative and non-empty slot and use it for our new context
             Some((SlotChoice::Back(batch), _)) => {
                 log::info!("start at non-empty slot {}", batch);
                 let (prefix, reload) = self.checkout(&tokens, batch).await;
@@ -368,9 +481,10 @@ impl<M, S, B> Runtime<M, S, B>
                     GenerateContext {
                         prefix: Tokens(tokens[..len].to_vec()),
                         suffix: Tokens(tokens[len..].to_vec()),
+                        bnf_sampler,
                         ..context
                     }
-                        .into(),
+                    .into(),
                 );
 
                 std::mem::swap(&mut state, &mut slots[batch]);
@@ -384,6 +498,7 @@ impl<M, S, B> Runtime<M, S, B>
                     _ => unreachable!(),
                 }
             }
+            // directly occupy an empty slot so no need backing
             Some((SlotChoice::Empty(batch), _)) => {
                 log::info!("start at empty slot {}", batch);
                 let (prefix, reload) = self.checkout(&tokens, batch).await;
@@ -394,15 +509,17 @@ impl<M, S, B> Runtime<M, S, B>
                     GenerateContext {
                         prefix: Tokens(tokens[..len].to_vec()),
                         suffix: Tokens(tokens[len..].to_vec()),
+                        bnf_sampler,
                         ..context
                     }
-                        .into(),
+                    .into(),
                 );
                 slots[batch] = state;
 
                 self.state.load_batch(&reload, batch).expect("load state");
                 SlotResult::Fault(batch)
             }
+            // continue from an existing slot. No need backing as well
             Some((SlotChoice::Continue(batch, len), _)) => {
                 log::info!("continue at slot {}", batch);
                 let tokens = [tokens, vec![last]].concat();
@@ -410,9 +527,10 @@ impl<M, S, B> Runtime<M, S, B>
                     GenerateContext {
                         prefix: Tokens(tokens[..len].to_vec()),
                         suffix: Tokens(tokens[len..].to_vec()),
+                        bnf_sampler,
                         ..context
                     }
-                        .into(),
+                    .into(),
                 );
                 slots[batch] = state;
                 SlotResult::Success(batch)
@@ -423,7 +541,6 @@ impl<M, S, B> Runtime<M, S, B>
     /// This critical section synchronizes `slots` and fills `payloads`.
     async fn prepare(&self, payloads: &mut [Payload]) {
         let mut slots = self.slots.lock().await;
-        let mut cache = self.backed.lock().await;
 
         // sync payloads and slots: kill dead payloads
         for (slot, payload) in slots.iter().zip_eq(payloads.iter_mut()) {
@@ -450,8 +567,13 @@ impl<M, S, B> Runtime<M, S, B>
                 let _ = context.sender.send(Token::Embed(embed));
             }
 
-            cache.insert(context.prefix.clone(), backed.into());
-            log::info!("backed slot {} of length {}", batch, context.prefix.len());
+            let mut cache = self.backed.lock().await;
+            cache.insert(context.prefix.clone(), CachedItem::new(backed));
+            log::info!(
+                "backed completed slot {} of length {}",
+                batch,
+                context.prefix.len()
+            );
 
             assert!(matches!(slots[batch], SlotState::Busy));
             slots[batch] = SlotState::Idle(context.prefix, Instant::now());
@@ -462,7 +584,7 @@ impl<M, S, B> Runtime<M, S, B>
             .iter()
             .filter(|x| matches!(x, Payload::Busy(_)))
             .count();
-        let remain = self.max_runtime_batch - self.max_runtime_batch.min(occupancy);
+        let remain = self.reload.max_runtime_batch - self.reload.max_runtime_batch.min(occupancy);
         let batches = slots
             .iter()
             .enumerate()
@@ -500,10 +622,7 @@ impl<M, S, B> Runtime<M, S, B>
             .collect_vec();
 
         // run the model until there is at least one slot finished
-        let occupancy = payloads
-            .iter()
-            .filter(|x| matches!(x, Payload::Busy(_)))
-            .count();
+        let occupancy = payloads.iter().filter(|x| x.is_busy()).count();
         let outputs = match occupancy {
             0 => vec![ModelOutput::None; payloads.len()],
             _ => loop {
@@ -513,36 +632,53 @@ impl<M, S, B> Runtime<M, S, B>
                 }
             },
         };
-        // let penalty_free_tokens = &self._penalty_free_tokens;
-        let outputs = payloads
-            .par_iter()
-            .zip_eq(outputs.into_par_iter())
+
+        // update raw outputs
+        let handles = payloads
+            .iter()
+            .zip_eq(outputs.into_iter())
             .map(|(payload, output)| match payload {
                 Payload::Busy(context) => match output {
                     ModelOutput::None => None,
-                    ModelOutput::Last(data) => Some(data),
-                    ModelOutput::Full(data) => Some(data.into_iter().last()?),
-                }
-                    .map(|mut data| {
-                        context
-                            .penalties
-                            .iter()
-                            // .filter(|(token, _)| !penalty_free_tokens.contains(token))
-                            .for_each(|(token, penalty)| data[*token as usize] -= penalty);
-                        context
-                            .request
-                            .logit_bias
-                            .iter()
-                            .for_each(|(token, bias)| data[*token as usize] += *bias);
-                        data
-                    }),
+                    ModelOutput::Last(data) => Some((
+                        context.bnf_sampler.clone(),
+                        context.request.sampler.clone(),
+                        context.request.bias.clone(),
+                        data,
+                    )),
+                    ModelOutput::Full(_) => unreachable!(),
+                },
                 _ => None,
             })
-            .map(|x| match x {
-                Some(data) => ModelOutput::Last(data),
-                None => ModelOutput::None,
+            .map(|bundle| async move {
+                match bundle {
+                    Some((bnf, sampler, bias, mut data)) => {
+                        sampler.read().await.transform(&mut data);
+                        for (token, bias) in bias.iter() {
+                            data[*token as usize] += *bias
+                        }
+                        if let Some(bnf) = bnf {
+                            let bnf = bnf.read().await;
+                            bnf.transform(&mut data);
+                        }
+                        Some(data)
+                    }
+                    None => None,
+                }
             })
-            .collect();
+            .map(tokio::spawn)
+            .collect_vec();
+        let outputs = {
+            let mut outputs = vec![];
+            for handle in handles {
+                let output = match handle.await? {
+                    Some(data) => ModelOutput::Last(data),
+                    None => ModelOutput::None,
+                };
+                outputs.push(output);
+            }
+            outputs
+        };
 
         // compute probabilities
         let outputs = match occupancy {
@@ -551,18 +687,32 @@ impl<M, S, B> Runtime<M, S, B>
         };
 
         // sample tokens
-        let outputs: Vec<_> = payloads
-            .par_iter()
-            .zip_eq(outputs.into_par_iter())
-            .map(|(payload, outputs)| match payload {
-                Payload::Busy(context) => match outputs {
+        let handles = payloads
+            .iter()
+            .zip_eq(outputs.into_iter())
+            .map(|(payload, output)| match payload {
+                Payload::Busy(context) => match output {
                     ModelOutput::None => None,
-                    ModelOutput::Last(data) => Some(context.request.sampler.sample(data)),
+                    ModelOutput::Last(data) => Some((context.request.sampler.clone(), data)),
                     ModelOutput::Full(_) => unreachable!(),
                 },
                 _ => None,
             })
-            .collect();
+            .map(|bundle| async move {
+                match bundle {
+                    Some((sampler, data)) => Some(sampler.write().await.sample(&data)),
+                    None => None,
+                }
+            })
+            .map(tokio::spawn)
+            .collect_vec();
+        let outputs = {
+            let mut outputs = vec![];
+            for handle in handles {
+                outputs.push(handle.await?);
+            }
+            outputs
+        };
 
         for (batch, payload, token, input) in payloads
             .iter_mut()
@@ -583,10 +733,6 @@ impl<M, S, B> Runtime<M, S, B>
             let len = model_tokens.len() - input.tokens.len();
             context.prefix = Tokens(model_tokens[..len].to_vec());
             context.suffix = Tokens(model_tokens[len..].to_vec());
-            context
-                .penalties
-                .iter_mut()
-                .for_each(|(_, penalty)| *penalty *= context.request.sampler.penalty_decay);
 
             let Some(token) = token else {
                 continue;
@@ -597,7 +743,7 @@ impl<M, S, B> Runtime<M, S, B>
                 let mut cache = self.backed.lock().await;
                 let backed = self.state.back_batch(batch).await.unwrap();
 
-                cache.insert(context.prefix.clone(), backed.into());
+                cache.insert(context.prefix.clone(), CachedItem::new(backed));
                 context.prompt_cached = true;
 
                 log::info!(
@@ -609,12 +755,6 @@ impl<M, S, B> Runtime<M, S, B>
 
             assert_eq!(context.suffix.len(), 0);
             context.suffix.0.push(token);
-
-            let penalty = match context.penalties.get(&token) {
-                Some(penalty) => penalty + context.request.sampler.frequency_penalty,
-                None => context.request.sampler.presence_penalty,
-            };
-            context.penalties.insert(token, penalty);
 
             let mut word = self.tokenizer.decode(&[token])?;
             context.model_text.append(&mut word.clone());
@@ -638,6 +778,20 @@ impl<M, S, B> Runtime<M, S, B>
                 let _ = context.sender.send(Token::Done);
                 done = true;
             };
+
+            // update the BNF state
+            let mut exhausted = false;
+            if let Some(bnf) = context.bnf_sampler.clone() {
+                let mut bnf = bnf.write().await;
+                match bnf.update(token) {
+                    AcceptTokenResult::Continue => {}
+                    AcceptTokenResult::End => exhausted = true,
+                    AcceptTokenResult::Failed => {
+                        log::warn!("slot {batch} bnf failure");
+                        exhausted = true;
+                    }
+                }
+            }
 
             // here we detect if there is a stop word in our buffer
             let ((head, tail), stop_matched) = context
@@ -676,14 +830,14 @@ impl<M, S, B> Runtime<M, S, B>
 
             if context.sender.is_disconnected() {
                 done = true;
-            } else if stop_matched {
+            } else if exhausted || stop_matched {
                 let output = String::from_utf8_lossy(head);
-                let _ = context.sender.send(Token::Token(output.into()));
+                let _ = context.sender.send(Token::Content(output.into()));
                 finish(FinishReason::Stop);
             } else if context.model_tokens.len() >= context.request.max_tokens {
                 finish(FinishReason::Length);
             } else if let Ok(word) = String::from_utf8(head.to_vec()) {
-                let _ = context.sender.send(Token::Token(word));
+                let _ = context.sender.send(Token::Content(word));
                 context.buffer = tail.to_vec();
             }
 
@@ -692,14 +846,35 @@ impl<M, S, B> Runtime<M, S, B>
 
         Ok(())
     }
+
+    /// Keep the items in the cache less then [`MAX_CACHE_ITEMS`].
+    async fn maintain_cache(&self) {
+        let mut cache = self.backed.lock().await;
+        if cache.count() <= MAX_CACHE_ITEMS {
+            return;
+        }
+
+        let mut removing = vec![];
+        for (tokens, _) in cache
+            .iter()
+            .sorted_unstable_by_key(|(_, item)| item.instant.elapsed())
+            .skip(MAX_CACHE_ITEMS)
+        {
+            removing.push(tokens.to_owned());
+        }
+
+        for tokens in removing.into_iter() {
+            cache.remove(&tokens);
+        }
+    }
 }
 
 impl<M, S, B> Runner for Runtime<M, S, B>
-    where
-        B: BackedState + Send + Sync,
-        S: ModelState<BackedState = B> + Send + Sync,
-        M: Model<State = S> + Send + Sync,
-        StateBuilder: Build<B, Error = Infallible>,
+where
+    B: BackedState + Send + Sync,
+    S: ModelState<BackedState = B> + Send + Sync,
+    M: Model<State = S> + Serialize + Send + Sync,
+    StateBuilder: Build<B, Error = Infallible>,
 {
     #[inline]
     fn info(&self) -> &ModelInfo {
@@ -717,6 +892,16 @@ impl<M, S, B> Runner for Runtime<M, S, B>
     }
 
     #[inline]
+    fn reload(&self) -> &ReloadRequest {
+        self.reload()
+    }
+
+    #[inline]
+    fn serialize_model(&self, path: PathBuf) -> Result<()> {
+        Runtime::serialize_model(self, path)
+    }
+
+    #[inline]
     fn queue(
         &self,
         context: GenerateContext,
@@ -728,13 +913,31 @@ impl<M, S, B> Runner for Runtime<M, S, B>
     fn process<'a>(
         &'a self,
         payloads: &'a mut [Payload],
-    ) -> Pin<Box<dyn Future<Output =Result<()>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(self.process(payloads))
+    }
+
+    #[inline]
+    fn maintain_cache(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.maintain_cache())
     }
 }
 
 #[tokio::main]
 pub async fn run(receiver: Receiver<()>, env: Arc<RwLock<Environment>>) {
+    {
+        // this task constantly runs, cleaning up state cache
+        let env = env.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Environment::Loaded { runtime, .. } = &*env.read().await {
+                    runtime.maintain_cache().await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
     while let Ok(()) = receiver.recv_async().await {
         if let Environment::Loaded { runtime, .. } = &*env.read().await {
             let mut payloads = vec![Payload::default(); runtime.num_batch()];

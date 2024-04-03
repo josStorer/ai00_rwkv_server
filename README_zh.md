@@ -1,20 +1,20 @@
 # 💯AI00 Server
 <p align='center'>
-<image src="img/ai00.gif" />
+<image src="docs/public/logo.gif" />
 </p>
-
+ 
 <div align="center"> 
-
+    
 ![license](https://shields.io/badge/license-MIT%2FApache--2.0-blue)
-[![Rust Version](https://img.shields.io/badge/Rust-1.65.0+-blue)](https://releases.rs/docs/1.65.0)
-![PRs welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)
+[![Rust Version](https://img.shields.io/badge/Rust-1.75.0+-blue)](https://releases.rs/docs/1.75.0)
+![PRs welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)     
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
 [![All Contributors](https://img.shields.io/badge/all_contributors-5-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 
 
-[English](README.md) | [中文](README_zh.md)
+[English](README.md) | [中文](README_zh.md) 
 
 <div align="left"> 
  
@@ -41,10 +41,11 @@
 
 ### ⭕模型下载和转换
 
-You must [download the model](https://huggingface.co/BlinkDL) and put in assets/models before running if you are building from source.
-You may download the official RWKV World series models from HuggingFace, and convert them via the provided `convert_safetensors.py`.
+你必须（在构建时）[下载模型](https://huggingface.co/BlinkDL)并将其放置在`assets/models`中，如果你从源代码构建。
+你可以从 HuggingFace 下载官方 RWKV World 系列模型，并使用提供的`convert_safetensors.py`进行转换。
+如果你不想安装 Python，也可以前往[`web-rwkv`](https://github.com/cryscan/web-rwkv/releases)下载无依赖的转换器。
 
-你可以在这里下载已经转换好的V4 模型： [模型下载](https://huggingface.co/cgisky/RWKV-safetensors-fp16)
+你可以在这里下载已经转换好的V4 模型： [V5](https://huggingface.co/cgisky/AI00_RWKV_V5) 或者 [V6](https://huggingface.co/cgisky/ai00_rwkv_x060)
 
 
 ## 安装、编译和使用
@@ -53,7 +54,7 @@ You may download the official RWKV World series models from HuggingFace, and con
 
 1. 直接从 [Release](https://github.com/cgisky1980/ai00_rwkv_server/releases) 下载最新版本
 
-2. [下载模型](https://huggingface.co/cgisky/RWKV-safetensors-fp16)后把模型放在`assets/models/`路径，例如`assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
+2. [下载模型](https://huggingface.co/cgisky/RWKV-safetensors-fp16)后把模型放在`assets/models/`路径，例如`assets/models/RWKV-x060-World-3B-v2-20240228-ctx4096.st`
 
 3. 你可以修改 [`assets/configs/Config.toml`](./assets/configs/Config.toml) 里面的模型配置，包括模型路径、量化层数等
 
@@ -63,7 +64,7 @@ You may download the official RWKV World series models from HuggingFace, and con
     ./ai00_rwkv_server
     ```
 5. 打开浏览器，访问WebUI
-   [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
+   [`https://localhost:65530`](https://localhost:65530)
 
 ### 📜从源码编译
 
@@ -75,26 +76,26 @@ You may download the official RWKV World series models from HuggingFace, and con
     git clone https://github.com/cgisky1980/ai00_rwkv_server.git
     cd ai00_rwkv_server
     ```
-
+    
 
 3. [下载模型](https://huggingface.co/cgisky/RWKV-safetensors-fp16)后把模型放在
-   `assets/models/`路径下，例如`assets/models/RWKV-4-World-0.4B-v1-20230529-ctx4096.st`
+`assets/models/`路径下，例如`assets/models/RWKV-x060-World-3B-v2-20240228-ctx4096.st`
 
 4. 编译
 
     ```bash
     cargo build --release
     ```
-
+     
 
 5. 编译完成后运行
-
+   
     ```bash     
     cargo run --release
     ```
-
+   
 6. 打开浏览器，访问WebUI
-   [`http://127.0.0.1:65530`](http://127.0.0.1:65530)
+   [`https://localhost:65530`](https://localhost:65530)
 
 ### 📒模型转换
 
@@ -110,7 +111,13 @@ You may download the official RWKV World series models from HuggingFace, and con
     $ python convert_safetensors.py --input ./filename.pth --output ./filename.st
     ```
 
-4. 根据上文步骤，将转换所得的`.st`模型文件放在`assets/models/`路径下，并修改  [`assets/Config.toml`](./assets/Config.toml) 中的模型路径
+4. 如果你不想安装 Python 或 Torch，可以前往[`web-rwkv`](https://github.com/cryscan/web-rwkv/releases)并下载不依赖于 Python 或 Torch 的转换器`web-rwkv-converter`
+
+    ```bash
+    $ ./web-rwkv-converter --input /path/to/model.pth
+    ```
+
+5. 根据上文步骤，将转换所得的`.st`模型文件放在`assets/models/`路径下，并修改  [`assets/Config.toml`](./assets/Config.toml) 中的模型路径
 
 
 ## 📝支持的启动参数
@@ -138,11 +145,11 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 
 <image src="img/chat.gif" />
 
-### 续写功能
+### 续写功能  
 
 <image src="img/continuation.gif" />
 
-### 写论文功能
+### 写论文功能  
 
 <image src="img/paper.gif" />
 
@@ -176,7 +183,7 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 - 加入我们的 QQ 群
 - 在 GitHub 上提交问题或拉取请求
 - 在我们的网站上留下反馈
-
+  
 我们迫不及待地想与你合作，让这个项目变得更好！希望项目对你有帮助！
 
 ## Thanks
@@ -194,7 +201,7 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
   <tbody>
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/cgisky1980"><img src="https://avatars.githubusercontent.com/u/82481660?v=4?s=100" width="100px;" alt="顾真牛"/><br /><sub><b>顾真牛</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=cgisky1980" title="Documentation">📖</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=cgisky1980" title="Code">💻</a> <a href="#content-cgisky1980" title="Content">🖋</a> <a href="#design-cgisky1980" title="Design">🎨</a> <a href="#mentoring-cgisky1980" title="Mentoring">🧑‍🏫</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://cryscan.github.io/profile"><img src="https://avatars.githubusercontent.com/u/16053640?v=4?s=100" width="100px;" alt="研究社交"/><br /><sub><b>研究社交</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=cryscan" title="Code">💻</a> <a href="#example-cryscan" title="Examples">💡</a> <a href="#ideas-cryscan" title="Ideas, Planning, & Feedback">🤔</a> <a href="#maintenance-cryscan" title="Maintenance">🚧</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/pulls?q=is%3Apr+reviewed-by%3Acryscan" title="Reviewed Pull Requests">👀</a> <a href="#platform-cryscan" title="Packaging/porting to new platform">📦</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://cryscan.github.io/profile"><img src="https://avatars.githubusercontent.com/u/16053640?v=4?s=100" width="100px;" alt="研究社交"/><br /><sub><b>研究社交</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=cryscan" title="Code">💻</a> <a href="#example-cryscan" title="Examples">💡</a> <a href="#ideas-cryscan" title="Ideas, Planning, & Feedback">🤔</a> <a href="#maintenance-cryscan" title="Maintenance">🚧</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/pulls?q=is%3Apr+reviewed-by%3Acryscan" title="Reviewed Pull Requests">👀</a> <a href="#platform-cryscan" title="Packaging/porting to new platform">📦</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/josStorer"><img src="https://avatars.githubusercontent.com/u/13366013?v=4?s=100" width="100px;" alt="josc146"/><br /><sub><b>josc146</b></sub></a><br /><a href="https://github.com/cgisky1980/ai00_rwkv_server/issues?q=author%3AjosStorer" title="Bug reports">🐛</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=josStorer" title="Code">💻</a> <a href="#ideas-josStorer" title="Ideas, Planning, & Feedback">🤔</a> <a href="#tool-josStorer" title="Tools">🔧</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/l15y"><img src="https://avatars.githubusercontent.com/u/11372524?v=4?s=100" width="100px;" alt="l15y"/><br /><sub><b>l15y</b></sub></a><br /><a href="#tool-l15y" title="Tools">🔧</a> <a href="#plugin-l15y" title="Plugin/utility libraries">🔌</a> <a href="https://github.com/cgisky1980/ai00_rwkv_server/commits?author=l15y" title="Code">💻</a></td>
     </tr>
@@ -213,9 +220,9 @@ API 服务开启于 65530 端口, 数据输入已经输出格式遵循Openai API
 
 - 来自 QQ 群
 
-  ![image](https://github.com/cgisky1980/ai00_rwkv_server/assets/82481660/6e324617-6d0c-49fd-ab1e-fd9cf02df51e)
+    ![image](https://github.com/cgisky1980/ai00_rwkv_server/assets/82481660/6e324617-6d0c-49fd-ab1e-fd9cf02df51e)
 
-- 来自 Github
+- 来自 Github 
 
 - 来自 Discord
 

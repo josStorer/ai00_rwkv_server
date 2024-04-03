@@ -8,11 +8,11 @@ hero:
   tagline: 支持 Vulkan/Dx12/openGL 的并发推理服务器
   actions:
     - theme: brand
-      text: 快速上手
+      text: 快速上手！
       link: /markdown-examples
     - theme: alt
       text: 下载安装  
-      link: https://github.com/cgisky1980/ai00_rwkv_server/releases
+      link: https://github.com/Ai00-X/ai00_server/releases
 
   image:
     src: /logo.gif

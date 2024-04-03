@@ -1,41 +1,16 @@
 use std::{
     fs::{File, Metadata},
-    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Result};
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use anyhow::Result;
 use itertools::Itertools;
-use memmap2::Mmap;
+use salvo::{macros::Extractible, prelude::*};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, ThreadState};
-
-const PERMITTED_PATHS: [&str; 4] = [
-    "assets/models",
-    "assets/tokenizer",
-    "assets/configs",
-    "assets/www",
-];
-const UNZIP_PATHS: [&str; 2] = ["assets/unzip", "assets/temp"];
-
-fn check_path_permitted(path: impl AsRef<Path>, permitted: &[&str]) -> Result<()> {
-    let current_path = std::env::current_dir()?;
-    for sub in permitted {
-        let permitted = std::fs::canonicalize(current_path.join(sub))?;
-        let path = std::fs::canonicalize(path.as_ref())?;
-        if path.starts_with(permitted) {
-            return Ok(());
-        }
-    }
-    bail!("path not valid");
-}
-
-fn check_path(path: impl AsRef<Path>) -> Result<()> {
-    check_path_permitted(path, &PERMITTED_PATHS)
-}
+use crate::ThreadState;
 
 fn compute_sha(path: impl AsRef<Path>, meta: &Metadata) -> Result<String> {
     let file = File::open(path.as_ref())?;
@@ -61,32 +36,28 @@ fn compute_sha(path: impl AsRef<Path>, meta: &Metadata) -> Result<String> {
     Ok(format!("{:x}", result))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Extractible)]
+#[salvo(extract(default_source(from = "body")))]
 pub struct FileInfoRequest {
     path: PathBuf,
     #[serde(default)]
     is_sha: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema, ToResponse)]
 pub struct FileInfo {
     name: String,
     size: u64,
     sha: String,
 }
 
-/// `/api/files/dir`, `/api/files/ls`.
-pub async fn dir(
-    State(ThreadState(_)): State<ThreadState>,
+async fn dir_inner(
+    _depot: &mut Depot,
     Json(request): Json<FileInfoRequest>,
-) -> impl IntoResponse {
-    if let Err(err) = check_path(&request.path) {
-        log::error!("check path failed: {}", err);
-        return Err(StatusCode::FORBIDDEN);
-    }
+) -> Result<(StatusCode, Vec<FileInfo>), StatusCode> {
     match std::fs::read_dir(request.path) {
-        Ok(dir) => {
-            let files = dir
+        Ok(path) => {
+            let files = path
                 .filter_map(|x| x.ok())
                 .filter(|x| x.path().is_file())
                 .filter_map(|x| {
@@ -107,7 +78,7 @@ pub async fn dir(
                     })
                 })
                 .collect_vec();
-            Ok((StatusCode::OK, Json(files)))
+            Ok((StatusCode::OK, files))
         }
         Err(err) => {
             log::error!("failed to read directory: {}", err);
@@ -117,118 +88,21 @@ pub async fn dir(
 }
 
 /// `/api/models/list`.
-pub async fn models(state: State<ThreadState>) -> impl IntoResponse {
+#[handler]
+pub async fn models(depot: &mut Depot, res: &mut Response) {
+    let ThreadState { model, .. } = depot.obtain::<ThreadState>().unwrap();
     let request = FileInfoRequest {
-        path: "assets/models".into(),
+        path: model.clone(),
         is_sha: true,
     };
-    dir(state, Json(request)).await
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UnzipRequest {
-    #[serde(alias = "zip_path")]
-    path: PathBuf,
-    #[serde(alias = "target_dir")]
-    output: PathBuf,
-}
-
-/// `/api/files/unzip`.
-pub async fn unzip(
-    State(ThreadState(_)): State<ThreadState>,
-    Json(request): Json<UnzipRequest>,
-) -> StatusCode {
-    if let Err(err) = check_path(&request.path) {
-        log::error!("check path failed: {}", err);
-        return StatusCode::FORBIDDEN;
-    }
-    if let Err(err) = check_path_permitted(&request.output, &UNZIP_PATHS) {
-        log::error!("check path failed: {}", err);
-        return StatusCode::FORBIDDEN;
-    }
-
-    let unzip = move || -> Result<()> {
-        if Path::new(&request.output).exists() {
-            std::fs::remove_dir_all(&request.output)?;
+    match dir_inner(depot, Json(request)).await {
+        Ok((status, files)) => {
+            res.status_code(status);
+            res.render(Json(files));
         }
-        std::fs::create_dir_all(&request.output)?;
-
-        let file = File::open(&request.path)?;
-        let map = unsafe { Mmap::map(&file)? };
-        zip_extract::extract(Cursor::new(&map), &request.output, false)?;
-
-        Ok(())
-    };
-
-    match unzip() {
-        Ok(_) => StatusCode::OK,
-        Err(err) => {
-            log::error!("failed to unzip: {}", err);
-            StatusCode::NOT_FOUND
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LoadRequest {
-    path: PathBuf,
-}
-
-/// `/api/files/config/load`.
-pub async fn load_config(
-    State(ThreadState(_)): State<ThreadState>,
-    Json(request): Json<LoadRequest>,
-) -> impl IntoResponse {
-    if let Err(err) = check_path(&request.path) {
-        log::error!("check path failed: {}", err);
-        return Err(StatusCode::FORBIDDEN);
-    }
-    match crate::load_config(request.path) {
-        Ok(config) => Ok((StatusCode::OK, Json(config))),
-        Err(err) => {
-            log::error!("failed to load config: {}", err);
-            Err(StatusCode::NOT_FOUND)
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SaveRequest {
-    path: PathBuf,
-    config: Config,
-}
-
-/// `/api/files/config/save`.
-pub async fn save_config(
-    State(ThreadState(_)): State<ThreadState>,
-    Json(request): Json<SaveRequest>,
-) -> StatusCode {
-    if let Err(err) = check_path(&request.path) {
-        log::error!("check path failed: {}", err);
-        return StatusCode::FORBIDDEN;
-    }
-
-    let write = || -> Result<()> {
-        let mut file = File::create(&request.path)?;
-        let buf = toml::to_string(&request.config)?.into_bytes();
-        file.write_all(&buf)?;
-        Ok(())
-    };
-
-    match request.path.extension() {
-        Some(ext) if ext == "toml" => match write() {
-            Ok(_) => StatusCode::OK,
-            Err(err) => {
-                log::error!("failed to save config: {err}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        },
-        _ => {
-            log::error!(
-                "failed to save config: file path {} is not toml",
-                request.path.to_string_lossy()
-            );
-            StatusCode::FORBIDDEN
+        Err(status) => {
+            res.status_code(status);
+            res.render("ERROR");
         }
     }
 }
