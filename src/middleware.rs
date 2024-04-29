@@ -1,8 +1,5 @@
 use std::{
     collections::HashMap,
-    convert::Infallible,
-    fs::File,
-    io::{BufReader, Read},
     mem,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,7 +11,6 @@ use anyhow::{bail, Result};
 use bnf_sampler::{utils::U8ArrayWrapper, vocabulary::Vocabulary};
 use derivative::Derivative;
 use flume::{Receiver, Sender};
-use half::f16;
 use itertools::Itertools;
 use memmap2::Mmap;
 use qp_trie::Trie;
@@ -22,23 +18,28 @@ use rustc_hash::FxHashMap;
 use safetensors::SafeTensors;
 use salvo::oapi::{ToResponse, ToSchema};
 use serde::{de::DeserializeSeed, Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::{fs::File, io::BufReader};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Mutex, RwLock},
+};
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
-    model::{
-        Build,
-        BuildFuture, EmbedDevice, loader::{Loader, Lora, LoraBlend}, Model, ModelBuilder, ModelInfo, ModelState, ModelVersion, StateBuilder,
+    runtime::{
+        loader::{Loader, Lora, LoraBlend},
+        model::{
+            Build, ContextAutoLimits, EmbedDevice, ModelBuilder, ModelInfo, ModelVersion, Quant,
+        },
         v4, v5, v6,
     },
     tensor::serialization::Seed,
     tokenizer::Tokenizer,
     wgpu::{Backends, PowerPreference},
 };
-use web_rwkv::model::Quant;
 
 use crate::{
     config::{AdapterOption, BnfOption},
-    run::{GenerateContext, Runner, Runtime, SlotResult, Tokens},
+    run::{GenerateContext, Runtime, SlotResult, Tokens},
     sampler::{nucleus::NucleusSampler, Sampler},
 };
 
@@ -79,8 +80,8 @@ pub enum Array<T: ToSchema + 'static> {
 }
 
 impl<T> From<Array<T>> for Vec<T>
-where
-    T: std::fmt::Debug + Clone + Serialize + ToSchema,
+    where
+        T: std::fmt::Debug + Clone + Serialize + ToSchema,
 {
     fn from(value: Array<T>) -> Self {
         match value {
@@ -117,9 +118,7 @@ pub enum ThreadRequest {
 
 #[derive(Default)]
 pub enum Environment {
-    Loaded {
-        runtime: Box<dyn Runner + Send + Sync>,
-    },
+    Loaded(Runtime),
     #[default]
     None,
 }
@@ -128,15 +127,17 @@ impl Environment {
     pub async fn enqueue(&self, context: GenerateContext) -> Vec<GenerateContext> {
         let mut queue = vec![];
         match self {
-            Environment::Loaded { runtime, .. } => match runtime.queue(context).await {
-                SlotResult::Success(batch) => log::info!("queued task at slot {batch}"),
-                SlotResult::Fault(batch) => log::info!("swapped task at slot {batch}"),
-                SlotResult::Failure(context) => {
-                    log::info!("failed to queue task");
-                    queue.push(*context);
+            Environment::Loaded(runtime) => {
+                match runtime.queue(context).await.expect("queue task error") {
+                    SlotResult::Success(batch) => log::info!("queued task at slot {batch}"),
+                    SlotResult::Fault(batch) => log::info!("swapped task at slot {batch}"),
+                    SlotResult::Failure(context) => {
+                        log::info!("failed to queue task");
+                        queue.push(*context);
+                    }
+                    SlotResult::Error(reason) => log::warn!("queue task failed: {}", reason),
                 }
-                SlotResult::Error(reason) => log::warn!("queue task failed: {}", reason),
-            },
+            }
             Environment::None => queue.push(context),
         };
         queue
@@ -170,8 +171,8 @@ pub struct GenerateRequest {
     pub bnf_schema: Option<String>,
     /// Sampler parameters.
     #[derivative(
-        Debug = "ignore",
-        Default(value = "Arc::new(RwLock::new(NucleusSampler::default()))")
+    Debug = "ignore",
+    Default(value = "Arc::new(RwLock::new(NucleusSampler::default()))")
     )]
     pub sampler: Arc<RwLock<dyn Sampler + Send + Sync>>,
     /// Whether this is an embedding request.
@@ -190,15 +191,9 @@ pub struct ReloadRequest {
     pub lora: Vec<crate::config::Lora>,
     /// Specify layers that needs to be quantized.
     pub strategy: String,
-    /// Whether to use alternative GEMM kernel to speed-up long prompts.
-    #[derivative(Default(value = "true"))]
-    pub turbo: bool,
     /// Maximum tokens to be processed in parallel at once.
-    #[derivative(Default(value = "128"))]
+    #[derivative(Default(value = "32"))]
     pub token_chunk_size: usize,
-    /// The chunk size of layers in model state.
-    #[derivative(Default(value = "4"))]
-    pub state_chunk_size: usize,
     #[derivative(Default(value = "8"))]
     /// Maximum number of batches that are active at once.
     pub max_runtime_batch: usize,
@@ -256,17 +251,17 @@ async fn create_context(adapter: AdapterOption, info: &ModelInfo) -> Result<Cont
         AdapterOption::Manual(selection) => instance.select_adapter(backends, selection),
     }?;
     let context = ContextBuilder::new(adapter)
-        .with_auto_limits(info)
+        .auto_limits(info)
         .build()
         .await?;
     Ok(context)
 }
 
-fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
-    let file = File::open(path)?;
+async fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
+    let file = File::open(path).await?;
     let mut reader = BufReader::new(file);
     let mut contents = String::new();
-    reader.read_to_string(&mut contents)?;
+    reader.read_to_string(&mut contents).await?;
     Ok(Tokenizer::new(&contents)?)
 }
 
@@ -288,100 +283,127 @@ fn load_vocab(tokenizer: &Tokenizer) -> Vocabulary {
     }
 }
 
-async fn load_model<M, S>(
+async fn load_runtime(
     context: &Context,
-    request: &ReloadRequest,
-    load_type: LoadType,
-) -> Result<(M, S)>
-where
-    S: ModelState,
-    M: Model<State = S>,
-    for<'a> ModelBuilder<SafeTensors<'a>>: BuildFuture<M, Error = anyhow::Error>,
-    for<'de> Seed<'de, Context, M>: DeserializeSeed<'de, Value = M>,
-    StateBuilder: Build<S, Error = Infallible>,
-{
+    reload: &ReloadRequest,
+    info: ModelInfo,
+    load: LoadType,
+) -> Result<Runtime> {
     let ReloadRequest {
         model: model_path,
-        strategy,
-        lora,
+        max_batch,
+        tokenizer_path,
         token_chunk_size,
-        turbo,
-        embed_device,
+        strategy,
         ..
-    } = request.clone();
+    } = reload.clone();
 
-    let file = File::open(model_path)?;
+    let tokenizer = load_tokenizer(tokenizer_path).await?;
+    let vocab = load_vocab(&tokenizer);
+
+    let file = File::open(model_path).await?;
     let data = unsafe { Mmap::map(&file) }?;
 
-    let model = match load_type {
-        LoadType::SafeTensors => {
-            let model = SafeTensors::deserialize(&data)?;
+    async fn load_model<M>(
+        context: &Context,
+        load: LoadType,
+        data: &[u8],
+        reload: &ReloadRequest,
+    ) -> Result<M>
+        where
+                for<'a> ModelBuilder<SafeTensors<'a>>: Build<M>,
+                for<'de> Seed<'de, Context, M>: DeserializeSeed<'de, Value=M>,
+    {
+        match load {
+            LoadType::SafeTensors => {
+                let ReloadRequest {
+                    strategy,
+                    lora,
+                    embed_device,
+                    ..
+                } = reload.clone();
 
-            let quant_type = if strategy.contains("i8") {
-                Quant::Int8
-            } else if strategy.contains("i4") {
-                Quant::NF4
-            } else {
-                Quant::None
-            };
+                let model = SafeTensors::deserialize(data)?;
 
-            let layer = strategy
-                .split_whitespace()
-                .flat_map(|s| s.split(','))
-                .find_map(|s| s.strip_prefix("layer").and_then(|n| n.parse::<usize>().ok()))
-                .unwrap_or(26);
-            let chunk_size = strategy
-                .split_whitespace()
-                .flat_map(|s| s.split(','))
-                .find_map(|s| s.strip_prefix("chunk").and_then(|n| n.parse::<usize>().ok()))
-                .unwrap_or(token_chunk_size);
-            let quant = (0..layer).map(|layer| (layer, quant_type)).collect();
+                let quant_type = if strategy.contains("i8") {
+                    Quant::Int8
+                } else if strategy.contains("i4") {
+                    Quant::NF4
+                } else {
+                    Quant::None
+                };
 
-            let model = ModelBuilder::new(context, model)
-                .with_quant(quant)
-                .with_turbo(turbo)
-                .with_embed_device(embed_device)
-                .with_token_chunk_size(chunk_size);
+                let layer = strategy
+                    .split_whitespace()
+                    .flat_map(|s| s.split(','))
+                    .find_map(|s| s.strip_prefix("layer").and_then(|n| n.parse::<usize>().ok()))
+                    .unwrap_or(26);
+                let quant = (0..layer).map(|layer| (layer, quant_type)).collect();
 
-            let lora: Vec<_> = lora
-                .into_iter()
-                .map(|lora| -> Result<_> {
-                    let file = File::open(lora.path)?;
-                    let data = unsafe { Mmap::map(&file) }?;
-                    let blend = LoraBlend::full(lora.alpha);
-                    Ok((data, blend))
-                })
-                .try_collect()?;
-            let lora: Vec<_> = lora
-                .iter()
-                .map(|(data, blend)| -> Result<_> {
-                    let data = SafeTensors::deserialize(data)?;
-                    let blend = blend.clone();
-                    Ok(Lora { data, blend })
-                })
-                .try_collect()?;
-            let model: M = lora
-                .into_iter()
-                .fold(model, |acc, x| acc.add_lora(x))
-                .build()
-                .await?;
-            model
+                let lora = {
+                    let mut x = Vec::with_capacity(lora.len());
+                    for lora in lora.into_iter() {
+                        let file = File::open(lora.path).await?;
+                        let data = unsafe { Mmap::map(&file) }?;
+                        let blend = LoraBlend::full(lora.alpha);
+                        x.push((data, blend))
+                    }
+                    x
+                };
+                let lora: Vec<_> = lora
+                    .iter()
+                    .map(|(data, blend)| -> Result<_> {
+                        let data = SafeTensors::deserialize(data)?;
+                        let blend = blend.clone();
+                        Ok(Lora { data, blend })
+                    })
+                    .try_collect()?;
+
+                let builder = ModelBuilder::new(context, model)
+                    .quant(quant)
+                    .embed_device(embed_device);
+                let builder = lora.into_iter().fold(builder, |b, x| b.lora(x));
+                Build::<M>::build(builder).await
+            }
+            LoadType::Prefab => {
+                use cbor4ii::{core::utils::SliceReader, serde::Deserializer};
+
+                let reader = SliceReader::new(data);
+                let mut deserializer = Deserializer::new(reader);
+
+                let seed: Seed<Context, M> = Seed::new(context);
+                Ok(seed.deserialize(&mut deserializer)?)
+            }
         }
-        LoadType::Prefab => {
-            use cbor4ii::{core::utils::SliceReader, serde::Deserializer};
-            let reader = SliceReader::new(&data);
-            let mut deserializer = Deserializer::new(reader);
-            let seed = Seed::<Context, M>::new(context);
-            let model: M = seed.deserialize(&mut deserializer)?;
-            model
+    }
+
+    let context = context.clone();
+    let mut reload = reload.clone();
+    let chunk_size = strategy
+        .split_whitespace()
+        .flat_map(|s| s.split(','))
+        .find_map(|s| s.strip_prefix("chunk").and_then(|n| n.parse::<usize>().ok()))
+        .unwrap_or(token_chunk_size);
+    reload.token_chunk_size = chunk_size;
+    let runtime = match info.version {
+        ModelVersion::V4 => {
+            let model = load_model::<v4::Model>(&context, load, &data, &reload).await?;
+            let builder = v4::ModelJobBuilder::new(model, max_batch);
+            Runtime::new(context, builder, reload, tokenizer, vocab).await
+        }
+        ModelVersion::V5 => {
+            let model = load_model::<v5::Model>(&context, load, &data, &reload).await?;
+            let builder = v5::ModelJobBuilder::new(model, max_batch);
+            Runtime::new(context, builder, reload, tokenizer, vocab).await
+        }
+        ModelVersion::V6 => {
+            let model = load_model::<v6::Model>(&context, load, &data, &reload).await?;
+            let builder = v6::ModelJobBuilder::new(model, max_batch);
+            Runtime::new(context, builder, reload, tokenizer, vocab).await
         }
     };
 
-    let state: S = StateBuilder::new(context, model.info())
-        .with_num_batch(request.max_batch)
-        .with_chunk_size(request.state_chunk_size)
-        .build()?;
-    Ok((model, state))
+    Ok(runtime)
 }
 
 #[tokio::main]
@@ -425,7 +447,7 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                     let env = env.clone();
                     tokio::spawn(async move {
                         let env = &(*env.read().await);
-                        if let Environment::Loaded { runtime } = env {
+                        if let Environment::Loaded(runtime) = env {
                             let reload = runtime.reload().clone();
                             let model = runtime.info().clone();
                             let tokenizer = runtime.tokenizer();
@@ -447,10 +469,10 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                     let reload = async move {
                         let sender = sender.clone();
 
-                        let file = File::open(&request.model.canonicalize()?)?;
+                        let file = File::open(&request.model.canonicalize()?).await?;
                         let data = unsafe { Mmap::map(&file)? };
 
-                        let (info, load_type) = {
+                        let (info, load) = {
                             let st = SafeTensors::deserialize(&data);
                             let prefab = cbor4ii::serde::from_slice::<Prefab>(&data);
                             match (st, prefab) {
@@ -460,37 +482,16 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                             }
                         };
                         log::info!("{:#?}", info);
-                        log::info!("type: {:?}", load_type);
+                        log::info!("type: {:?}", load);
 
                         let context = create_context(request.adapter, &info).await?;
-                        let tokenizer = load_tokenizer(&request.tokenizer_path)?;
-                        let vocab = load_vocab(&tokenizer);
                         log::info!("{:#?}", context.adapter.get_info());
 
                         let mut env = env.write().await;
                         drop(mem::take(&mut *env));
 
-                        let runtime: Box<dyn Runner + Send + Sync> = match info.version {
-                            ModelVersion::V4 => {
-                                type M<'a> = v4::Model<'a, f16>;
-                                let (model, state) =
-                                    load_model::<M, _>(&context, &request, load_type).await?;
-                                Box::new(Runtime::new(tokenizer, vocab, model, state, request))
-                            }
-                            ModelVersion::V5 => {
-                                type M<'a> = v5::Model<'a, f16>;
-                                let (model, state) =
-                                    load_model::<M, _>(&context, &request, load_type).await?;
-                                Box::new(Runtime::new(tokenizer, vocab, model, state, request))
-                            }
-                            ModelVersion::V6 => {
-                                type M<'a> = v6::Model<'a, f16>;
-                                let (model, state) =
-                                    load_model::<M, _>(&context, &request, load_type).await?;
-                                Box::new(Runtime::new(tokenizer, vocab, model, state, request))
-                            }
-                        };
-                        *env = Environment::Loaded { runtime };
+                        let runtime = load_runtime(&context, &request, info, load).await?;
+                        *env = Environment::Loaded(runtime);
 
                         let _ = sender.send(());
                         anyhow::Ok(())
@@ -558,9 +559,9 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                     let env = env.clone();
                     tokio::spawn(async move {
                         let env = &(*env.read().await);
-                        if let Environment::Loaded { runtime, .. } = env {
+                        if let Environment::Loaded(runtime) = env {
                             log::info!("serializing model into {:?}", &request.model_path);
-                            let _ = match runtime.serialize_model(request.model_path) {
+                            let _ = match runtime.serialize_model(request.model_path).await {
                                 Ok(()) => sender.send(true),
                                 Err(err) => {
                                     log::error!("{}", err);

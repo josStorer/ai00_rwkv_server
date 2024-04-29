@@ -1,6 +1,6 @@
 use salvo::prelude::*;
 use serde::Serialize;
-use web_rwkv::model::ModelInfo;
+use web_rwkv::runtime::model::ModelInfo;
 
 use crate::{
     build_path,

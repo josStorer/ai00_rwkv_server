@@ -16,15 +16,9 @@ pub struct Model {
     pub model_name: PathBuf,
     /// Specify layers that needs to be quantized.
     pub strategy: String,
-    /// Whether to use alternative GEMM kernel to speed-up long prompts.
-    #[derivative(Default(value = "true"))]
-    pub turbo: bool,
     /// Maximum tokens to be processed in parallel at once.
     #[derivative(Default(value = "32"))]
     pub token_chunk_size: usize,
-    /// The chunk size of layers in model state.
-    #[derivative(Default(value = "4"))]
-    pub state_chunk_size: usize,
     /// Maximum number of batches that are active at once.
     #[derivative(Default(value = "8"))]
     pub max_runtime_batch: usize,
