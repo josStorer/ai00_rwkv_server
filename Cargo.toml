@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 name = "ai00_server"
 repository = "https://github.com/cgisky1980/ai00_rwkv_server"
 rust-version = "1.75"
-version = "0.4.2"
+version = "0.4.3"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -39,7 +39,7 @@ safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
-simple_logger = { version = "4.2", features = ["stderr"] }
+simple_logger = { version = "5.0.0", features = ["stderr"] }
 tempfile = "3.6"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8.6"
@@ -50,7 +50,7 @@ zip-extract = "0.1"
 
 [dependencies.web-rwkv]
 # path = "../web-rwkv"
-version = "0.7.6"
+version = "0.8.1"
 
 [dependencies.salvo]
 default-features = true
@@ -65,7 +65,7 @@ features = [
     "serve-static",
     "sse",
 ]
-version = "0.66"
+version = "0.67"
 
 # [dependencies.axum]
 # default-features = false

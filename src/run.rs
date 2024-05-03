@@ -19,9 +19,9 @@ use web_rwkv::{
     context::Context,
     runtime::{
         infer::{InferChunk, InferInfo, InferInput, InferInputBatch, InferOption, InferOutput},
-        model::{ModelInfo, ModelRuntime, State},
-        softmax::softmax,
-        Job, JobBuilder, JobRuntime, Submission,
+        Job,
+        JobBuilder,
+        JobRuntime, model::{ModelInfo, ModelRuntime, State}, softmax::softmax, Submission,
     },
     tensor::{TensorCpu, TensorInit},
     tokenizer::Tokenizer,
@@ -33,6 +33,7 @@ use crate::{
 };
 
 const _PENALTY_FREE_LIST: [&str; 5] = ["\n", ",", ".", "\u{002c}", "\u{002f}"];
+const END_OF_LINE_TOKEN: u16 = 261;
 const PROMPT_CACHE_TOKENS: usize = 32;
 const MAX_CACHE_ITEMS: usize = 256;
 const SAMPLER_ARENA_CAPACITY: usize = 1048576;
@@ -297,6 +298,7 @@ pub struct Runtime {
     state: Arc<dyn State + Send + Sync>,
     model: Arc<dyn ModelSerialize + Send + Sync>,
     runtime: JobRuntime<InferInput, InferOutput<f16>>,
+    init_state: Option<TensorCpu<f32>>,
     tokenizer: Arc<Tokenizer>,
     vocab: Arc<Vocabulary>,
     slots: Mutex<Vec<SlotState>>,
@@ -308,12 +310,13 @@ impl Runtime {
         context: Context,
         builder: B,
         reload: ReloadRequest,
+        init_state: Option<TensorCpu<f32>>,
         tokenizer: Tokenizer,
         vocab: Vocabulary,
     ) -> Self
-    where
-        J: Job<Info = InferInfo, Input = InferChunk, Output = InferOutput<f16>>,
-        B: JobBuilder<J, Info = InferInfo> + ModelRuntime,
+        where
+            J: Job<Info = InferInfo, Input = InferChunk, Output = InferOutput<f16>>,
+            B: JobBuilder<J, Info = InferInfo> + ModelRuntime,
     {
         let slots = (0..reload.max_batch)
             .map(|_| SlotState::default())
@@ -331,6 +334,7 @@ impl Runtime {
             state,
             model,
             runtime,
+            init_state,
             tokenizer: Arc::new(tokenizer),
             vocab: Arc::new(vocab),
             slots: Mutex::new(slots),
@@ -381,7 +385,7 @@ impl Runtime {
         let prefix = prefix[0..len].to_vec();
         let reload = match cache.remove(prefix[..].as_token_slice()) {
             Some(reload) => CachedItem::renew(reload),
-            None => CachedItem::new(self.state.init()),
+            None => CachedItem::new(self.init_state.clone().unwrap_or_else(|| self.state.init())),
         };
         if len > 0 {
             let key = Tokens(prefix.clone());
@@ -455,7 +459,7 @@ impl Runtime {
                     bnf_sampler,
                     ..context
                 }
-                .into(),
+                    .into(),
             )),
             // back a non-relative and non-empty slot and use it for our new context
             Some(SlotChoice::Back(batch)) => {
@@ -472,7 +476,7 @@ impl Runtime {
                         bnf_sampler,
                         ..context
                     }
-                    .into(),
+                        .into(),
                 );
 
                 std::mem::swap(&mut state, &mut slots[batch]);
@@ -493,7 +497,7 @@ impl Runtime {
                         bnf_sampler,
                         ..context
                     }
-                    .into(),
+                        .into(),
                 );
                 slots[batch] = state;
                 Ok(SlotResult::Fault(batch))
@@ -509,7 +513,7 @@ impl Runtime {
                         bnf_sampler,
                         ..context
                     }
-                    .into(),
+                        .into(),
                 );
                 slots[batch] = state;
                 Ok(SlotResult::Success(batch))
@@ -643,6 +647,7 @@ impl Runtime {
                         if let Some(bnf) = bnf {
                             bnf.read().await.transform(&mut data);
                         }
+                        // data[0] = f32::MIN;
 
                         let data = data.into_iter().map(f16::from_f32).collect_vec();
                         (batch, data)
@@ -669,7 +674,7 @@ impl Runtime {
         // sample tokens
         let mut set = tokio::task::JoinSet::new();
         for (batch, (payload, output)) in
-            payloads.iter_mut().zip_eq(outputs.into_iter()).enumerate()
+        payloads.iter_mut().zip_eq(outputs.into_iter()).enumerate()
         {
             match (payload, output) {
                 (Payload::Busy(context), output) if output.size() > 0 => {
@@ -692,7 +697,7 @@ impl Runtime {
 
         let inference = inference.unwrap();
         for (batch, (payload, input)) in
-            itertools::multizip((payloads.iter_mut(), inference.batches.into_iter())).enumerate()
+        itertools::multizip((payloads.iter_mut(), inference.batches.into_iter())).enumerate()
         {
             let Payload::Busy(context) = payload else {
                 continue;
@@ -726,6 +731,12 @@ impl Runtime {
                     context.prefix.len()
                 );
             }
+
+            // map token 0 output to "\n\n"
+            let token = match token {
+                0 => END_OF_LINE_TOKEN,
+                _ => token,
+            };
 
             assert_eq!(context.suffix.len(), 0);
             context.suffix.0.push(token);

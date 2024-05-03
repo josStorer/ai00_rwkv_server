@@ -11,8 +11,10 @@ use super::Sampler;
 #[derivative(Default)]
 pub struct NucleusParams {
     #[derivative(Default(value = "0.3"))]
+    #[serde(default = "default_top_p")]
     pub top_p: f32,
     #[derivative(Default(value = "1.0"))]
+    #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[derivative(Default(value = "0.0"))]
     #[serde(default = "default_presence_penalty")]
@@ -23,6 +25,14 @@ pub struct NucleusParams {
     #[derivative(Default(value = "0.99654026"))]
     #[serde(default = "default_penalty_decay")]
     pub penalty_decay: f32,
+}
+
+fn default_top_p() -> f32 {
+    NucleusParams::default().top_p
+}
+
+fn default_temperature() -> f32 {
+    NucleusParams::default().temperature
 }
 
 fn default_presence_penalty() -> f32 {
