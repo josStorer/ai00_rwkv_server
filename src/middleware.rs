@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Result};
 use bnf_sampler::{utils::U8ArrayWrapper, vocabulary::Vocabulary};
 use derivative::Derivative;
 use flume::{Receiver, Sender};
+use half::f16;
 use itertools::Itertools;
 use memmap2::Mmap;
 use qp_trie::Trie;
@@ -34,12 +35,12 @@ use web_rwkv::{
     },
     tensor::{serialization::Seed, TensorCpu},
     tokenizer::Tokenizer,
-    wgpu::{Backends, PowerPreference},
+    wgpu::{Backends, Maintain, PowerPreference},
 };
 
 use crate::{
-    config::{AdapterOption, BnfOption},
-    run::{GenerateContext, Runtime, SlotResult, Tokens},
+    config::{AdapterOption, BnfOption, Precision},
+    run::{GenerateContext, InitState, Runtime, SlotResult, StateId, Tokens},
     sampler::{nucleus::NucleusSampler, Sampler},
 };
 
@@ -148,6 +149,7 @@ impl Environment {
 pub struct RuntimeInfo {
     pub reload: ReloadRequest,
     pub model: ModelInfo,
+    pub states: Vec<(StateId, InitState)>,
     pub tokenizer: Arc<Tokenizer>,
 }
 
@@ -179,6 +181,8 @@ pub struct GenerateRequest {
     pub embed: bool,
     /// The (reversed) number of layer at which the output is as embedding.
     pub embed_layer: usize,
+    /// Initial state ID.
+    pub state: StateId,
 }
 
 #[derive(Debug, Derivative, Clone, Serialize, Deserialize)]
@@ -189,16 +193,17 @@ pub struct ReloadRequest {
     pub model: PathBuf,
     /// List of LoRA blended on the model.
     pub lora: Vec<crate::config::Lora>,
+    /// Path to the initial state.
+    pub state: Vec<crate::config::State>,
     /// Specify layers that needs to be quantized.
     pub strategy: String,
+    /// Precision for intermediate tensors (`Fp16` or `Fp32`).
+    pub precision: Precision,
     /// Maximum tokens to be processed in parallel at once.
     #[derivative(Default(value = "32"))]
     pub token_chunk_size: usize,
-    #[derivative(Default(value = "8"))]
-    /// Maximum number of batches that are active at once.
-    pub max_runtime_batch: usize,
     /// Number of states that are cached on GPU.
-    #[derivative(Default(value = "16"))]
+    #[derivative(Default(value = "8"))]
     pub max_batch: usize,
     /// Device to put the embed tensor.
     pub embed_device: EmbedDevice,
@@ -239,7 +244,7 @@ pub struct TokenCounter {
 #[derive(Clone)]
 pub struct ThreadState {
     pub sender: Sender<ThreadRequest>,
-    pub model: PathBuf,
+    pub path: PathBuf,
 }
 
 async fn create_context(adapter: AdapterOption, info: &ModelInfo) -> Result<Context> {
@@ -297,16 +302,7 @@ async fn load_init_state(
         ModelVersion::V5 => v5::read_state(context, info, model).await,
         ModelVersion::V6 => v6::read_state(context, info, model).await,
     };
-    match state {
-        Ok(state) => {
-            log::info!("initial state loaded");
-            Some(state)
-        }
-        Err(err) => {
-            log::warn!("initial state not loaded: {}", err);
-            None
-        }
-    }
+    state.ok()
 }
 
 async fn load_runtime(
@@ -318,6 +314,7 @@ async fn load_runtime(
     let ReloadRequest {
         model: model_path,
         lora,
+        state,
         strategy,
         max_batch,
         tokenizer_path,
@@ -332,78 +329,122 @@ async fn load_runtime(
     let file = File::open(model_path).await?;
     let data = unsafe { Mmap::map(&file) }?;
 
-    let runtime =match load {
-            LoadType::SafeTensors => {
-                let model = SafeTensors::deserialize(&data)?;
-                let init_state = load_init_state(context, &info, model).await;
+    let mut states = vec![];
+    for crate::config::State { path, id, default } in state {
+        let name = path.to_string_lossy().to_string();
+        let file = File::open(path).await?;
+        let data = unsafe { Mmap::map(&file) }?;
+        let model = SafeTensors::deserialize(&data)?;
+        if let Some(data) = load_init_state(context, &info, model).await {
+            let state = InitState {
+                name,
+                id,
+                data,
+                default,
+            };
+            log::info!("{:?}", state);
+            states.push(state);
+        }
+    }
 
-                let model = SafeTensors::deserialize(&data)?;
+    let runtime = match load {
+        LoadType::SafeTensors => {
+            let model = SafeTensors::deserialize(&data)?;
 
-                let quant_type = if strategy.contains("i8") {
-                    Quant::Int8
-                } else if strategy.contains("i4") {
-                    Quant::NF4
-                } else {
-                    Quant::None
+            if let Some(data) = load_init_state(context, &info, model).await {
+                let name = "internal".into();
+                let id = StateId::new();
+                let state = InitState {
+                    name,
+                    id,
+                    data,
+                    default: true,
                 };
+                states.push(state);
+            }
 
-                let layer = strategy
-                    .split_whitespace()
-                    .flat_map(|s| s.split(','))
-                    .find_map(|s| s.strip_prefix("layer").and_then(|n| n.parse::<usize>().ok()))
-                    .unwrap_or(26);
-                let quant = (0..layer).map(|layer| (layer, quant_type)).collect();
+            let model = SafeTensors::deserialize(&data)?;
 
-                let lora = {
-                    let mut x = Vec::with_capacity(lora.len());
-                    for lora in lora.into_iter() {
-                        let file = File::open(lora.path).await?;
-                        let data = unsafe { Mmap::map(&file) }?;
-                        let blend = LoraBlend::full(lora.alpha);
-                        x.push((data, blend))
-                    }
-                    x
-                };
-                let lora: Vec<_> = lora
-                    .iter()
-                    .map(|(data, blend)| -> Result<_> {
-                        let data = SafeTensors::deserialize(data)?;
-                        let blend = blend.clone();
-                        Ok(Lora { data, blend })
-                    })
-                    .try_collect()?;
+            let quant_type = if strategy.contains("i8") {
+                Quant::Int8
+            } else if strategy.contains("i4") {
+                Quant::NF4
+            } else {
+                Quant::None
+            };
 
-                let builder = ModelBuilder::new(context, model)
-                    .quant(quant)
-                    .embed_device(embed_device);
-                let builder = lora.into_iter().fold(builder, |b, x| b.lora(x));
+            let layer = strategy
+                .split_whitespace()
+                .flat_map(|s| s.split(','))
+                .find_map(|s| s.strip_prefix("layer").and_then(|n| n.parse::<usize>().ok()))
+                .unwrap_or(26);
+            let quant = (0..layer).map(|layer| (layer, quant_type)).collect();
 
-                let context = context.clone();
-                let mut reload = reload.clone();
-                let chunk_size = strategy
-                    .split_whitespace()
-                    .flat_map(|s| s.split(','))
-                    .find_map(|s| s.strip_prefix("chunk").and_then(|n| n.parse::<usize>().ok()))
-                    .unwrap_or(token_chunk_size);
-                reload.token_chunk_size = chunk_size;
-                match info.version {
-                    ModelVersion::V4 => {
-                        let model = Build::<v4::Model>::build(builder).await?;
-                        let builder = v4::ModelRuntime::new(model, max_batch);
-                        Runtime::new(context, builder, reload, init_state, tokenizer, vocab).await
-                    }
-                    ModelVersion::V5 => {
-                        let model = Build::<v5::Model>::build(builder).await?;
-                        let builder = v5::ModelRuntime::new(model, max_batch);
-                        Runtime::new(context, builder, reload, init_state, tokenizer, vocab).await
-                    }
-                    ModelVersion::V6 => {
-                        let model = Build::<v6::Model>::build(builder).await?;
-                        let builder = v6::ModelRuntime::new(model, max_batch);
-                        Runtime::new(context, builder, reload, init_state, tokenizer, vocab).await
-                    }
+            let lora = {
+                let mut x = Vec::with_capacity(lora.len());
+                for lora in lora.into_iter() {
+                    let file = File::open(lora.path).await?;
+                    let data = unsafe { Mmap::map(&file) }?;
+                    let blend = LoraBlend::full(lora.alpha);
+                    x.push((data, blend))
+                }
+                x
+            };
+            let lora: Vec<_> = lora
+                .iter()
+                .map(|(data, blend)| -> Result<_> {
+                    let data = SafeTensors::deserialize(data)?;
+                    let blend = blend.clone();
+                    Ok(Lora { data, blend })
+                })
+                .try_collect()?;
+
+            let builder = ModelBuilder::new(context, model)
+                .quant(quant)
+                .embed_device(embed_device);
+            let builder = lora.into_iter().fold(builder, |b, x| b.lora(x));
+
+            let context = context.clone();
+            let mut reload = reload.clone();
+            let chunk_size = strategy
+                .split_whitespace()
+                .flat_map(|s| s.split(','))
+                .find_map(|s| s.strip_prefix("chunk").and_then(|n| n.parse::<usize>().ok()))
+                .unwrap_or(token_chunk_size);
+            reload.token_chunk_size = chunk_size;
+            match (info.version, reload.precision) {
+                (ModelVersion::V4, Precision::Fp16) => {
+                    let model = Build::<v4::Model>::build(builder).await?;
+                    let builder = v4::ModelRuntime::<f16>::new(model, max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V5, Precision::Fp16) => {
+                    let model = Build::<v5::Model>::build(builder).await?;
+                    let builder = v5::ModelRuntime::<f16>::new(model, max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V6, Precision::Fp16) => {
+                    let model = Build::<v6::Model>::build(builder).await?;
+                    let builder = v6::ModelRuntime::<f16>::new(model, max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V4, Precision::Fp32) => {
+                    let model = Build::<v4::Model>::build(builder).await?;
+                    let builder = v4::ModelRuntime::<f32>::new(model, max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V5, Precision::Fp32) => {
+                    let model = Build::<v5::Model>::build(builder).await?;
+                    let builder = v5::ModelRuntime::<f32>::new(model, max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V6, Precision::Fp32) => {
+                    let model = Build::<v6::Model>::build(builder).await?;
+                    let builder = v6::ModelRuntime::<f32>::new(model, max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
                 }
             }
+        }
         LoadType::Prefab => {
             use cbor4ii::{core::utils::SliceReader, serde::Deserializer};
 
@@ -418,24 +459,42 @@ async fn load_runtime(
                 .find_map(|s| s.strip_prefix("chunk").and_then(|n| n.parse::<usize>().ok()))
                 .unwrap_or(token_chunk_size);
             reload.token_chunk_size = chunk_size;
-            match info.version {
-                ModelVersion::V4 => {
+            match (info.version, reload.precision) {
+                (ModelVersion::V4, Precision::Fp16) => {
                     let seed: Seed<_, v4::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let builder = v4::ModelRuntime::new(model, reload.max_batch);
-                    Runtime::new(context, builder, reload, None, tokenizer, vocab).await
+                    let builder = v4::ModelRuntime::<f16>::new(model, reload.max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
                 }
-                ModelVersion::V5 => {
+                (ModelVersion::V5, Precision::Fp16) => {
                     let seed: Seed<_, v5::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let builder = v5::ModelRuntime::new(model, reload.max_batch);
-                    Runtime::new(context, builder, reload, None, tokenizer, vocab).await
+                    let builder = v5::ModelRuntime::<f16>::new(model, reload.max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
                 }
-                ModelVersion::V6 => {
+                (ModelVersion::V6, Precision::Fp16) => {
                     let seed: Seed<_, v6::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let builder = v6::ModelRuntime::new(model, reload.max_batch);
-                    Runtime::new(context, builder, reload, None, tokenizer, vocab).await
+                    let builder = v6::ModelRuntime::<f16>::new(model, reload.max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V4, Precision::Fp32) => {
+                    let seed: Seed<_, v4::Model> = Seed::new(&context);
+                    let model = seed.deserialize(&mut deserializer)?;
+                    let builder = v4::ModelRuntime::<f32>::new(model, reload.max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V5, Precision::Fp32) => {
+                    let seed: Seed<_, v5::Model> = Seed::new(&context);
+                    let model = seed.deserialize(&mut deserializer)?;
+                    let builder = v5::ModelRuntime::<f32>::new(model, reload.max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
+                }
+                (ModelVersion::V6, Precision::Fp32) => {
+                    let seed: Seed<_, v6::Model> = Seed::new(&context);
+                    let model = seed.deserialize(&mut deserializer)?;
+                    let builder = v6::ModelRuntime::<f32>::new(model, reload.max_batch);
+                    Runtime::new(context, builder, reload, states, tokenizer, vocab).await
                 }
             }
         }
@@ -488,10 +547,12 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                         if let Environment::Loaded(runtime) = env {
                             let reload = runtime.reload().clone();
                             let model = runtime.info().clone();
+                            let states = runtime.states().await;
                             let tokenizer = runtime.tokenizer();
                             let _ = sender.send(RuntimeInfo {
                                 reload,
                                 model,
+                                states,
                                 tokenizer,
                             });
                         }
@@ -519,6 +580,7 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                                 _ => bail!("failed to read model info"),
                             }
                         };
+                        log::info!("loading model {:?}", request.model);
                         log::info!("{:#?}", info);
                         log::info!("type: {:?}", load);
 
@@ -526,7 +588,16 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                         log::info!("{:#?}", context.adapter.get_info());
 
                         let mut env = env.write().await;
-                        drop(mem::take(&mut *env));
+                        // drop(mem::take(&mut *env));
+                        'unload: {
+                            let env = mem::take(&mut *env);
+                            let context = match env {
+                                Environment::Loaded(runtime) => runtime.context().clone(),
+                                Environment::None => break 'unload,
+                            };
+                            context.queue.submit(None);
+                            context.device.poll(Maintain::Wait);
+                        }
 
                         let runtime = load_runtime(&context, &request, info, load).await?;
                         *env = Environment::Loaded(runtime);
@@ -543,7 +614,7 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                         match reload.await {
                             Ok(_) => {
                                 callback(true);
-                                log::info!("model reloaded")
+                                log::info!("model loaded")
                             }
                             Err(err) => {
                                 callback(false);
@@ -556,8 +627,15 @@ pub async fn model_route(receiver: Receiver<ThreadRequest>) -> Result<()> {
                     let env = env.clone();
                     tokio::spawn(async move {
                         let mut env = env.write().await;
-                        *env = Environment::None;
+                        let env = mem::take(&mut *env);
                         log::info!("model unloaded");
+
+                        let context = match env {
+                            Environment::Loaded(runtime) => runtime.context().clone(),
+                            Environment::None => return,
+                        };
+                        context.queue.submit(None);
+                        context.device.poll(Maintain::Wait);
                     });
                 }
                 ThreadRequest::Generate {

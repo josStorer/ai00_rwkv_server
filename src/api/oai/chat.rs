@@ -13,6 +13,7 @@ use crate::{
         Array, FinishReason, GenerateRequest, MAX_TOKENS, ThreadRequest, ThreadState, Token,
         TokenCounter,
     },
+    run::StateId,
     sampler::Sampler,
 };
 
@@ -66,6 +67,8 @@ pub struct ChatRequest {
     bias: HashMap<u16, f32>,
     #[serde(flatten)]
     sampler: SamplerParams,
+    #[serde(default)]
+    state: StateId,
 }
 
 impl Default for ChatRequest {
@@ -80,6 +83,7 @@ impl Default for ChatRequest {
             stream: false,
             bias: HashMap::new(),
             sampler: Default::default(),
+            state: Default::default(),
         }
     }
 }
@@ -115,6 +119,7 @@ impl From<ChatRequest> for GenerateRequest {
             stop,
             sampler,
             bias,
+            state,
             ..
         } = value;
 
@@ -153,6 +158,7 @@ impl From<ChatRequest> for GenerateRequest {
             stop,
             sampler,
             bias,
+            state,
             ..Default::default()
         }
     }

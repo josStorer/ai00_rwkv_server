@@ -10,8 +10,8 @@ keywords = ["LLM", "deep-learning", "model", "rwkv"]
 license = "MIT OR Apache-2.0"
 name = "ai00_server"
 repository = "https://github.com/cgisky1980/ai00_rwkv_server"
-rust-version = "1.75"
-version = "0.4.3"
+rust-version = "1.78"
+version = "0.4.8"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -45,12 +45,16 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8.6"
 tower = { version = "0.4.13", features = ["full"] }
 tower-http = { version = "0.5.0", features = ["full"] }
+uid = "0.1.7"
+uuid = { version = "1.8.0", features = ["serde"] }
 web-rwkv-converter = "0.1.1"
 zip-extract = "0.1"
 
 [dependencies.web-rwkv]
 # path = "../web-rwkv"
-version = "0.8.1"
+default-features = false
+features = ["native"]
+version = "0.8.8"
 
 [dependencies.salvo]
 default-features = true

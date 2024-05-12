@@ -77,9 +77,16 @@ async fn main() {
         .with_module_level("ai00_server", log::LevelFilter::Info)
         .with_module_level("web_rwkv", log::LevelFilter::Info)
         .init()
-        .unwrap();
+        .expect("start logger");
 
     let args = Args::parse();
+
+    let cmd = Args::command();
+    let version = cmd.get_version().unwrap_or("0.0.1");
+    let bin_name = cmd.get_bin_name().unwrap_or("ai00_server");
+
+    log::info!("{}\tversion: {}", bin_name, version);
+
     let (sender, receiver) = flume::unbounded::<ThreadRequest>();
     tokio::task::spawn_blocking(move || model_route(receiver));
 
@@ -109,14 +116,10 @@ async fn main() {
         .hoop(
             affix::inject(ThreadState {
                 sender,
-                model: Default::default(),
+                path: Default::default(),
             })
         )
         .push(api_router);
-
-    let cmd = Args::command();
-    let version = cmd.get_version().unwrap_or("0.0.1");
-    let bin_name = cmd.get_bin_name().unwrap_or("ai00_server");
 
     let doc = OpenApi::new(bin_name, version).merge_router(&app);
 

@@ -18,19 +18,25 @@ pub struct InfoResponse {
 /// `/api/models/load`.
 #[handler]
 pub async fn load(depot: &mut Depot, req: &mut Request) -> StatusCode {
-    let ThreadState { sender, model } = depot.obtain::<ThreadState>().unwrap();
+    let ThreadState { sender, path } = depot.obtain::<ThreadState>().unwrap();
     let (result_sender, result_receiver) = flume::unbounded();
     let mut request: ReloadRequest = req.parse_body().await.unwrap();
 
     // make sure that we are not visiting un-permitted path.
-    request.model = match build_path(model, &request.model) {
+    request.model = match build_path(path, request.model) {
         Ok(path) => path,
         Err(_) => return StatusCode::NOT_FOUND,
     };
-    for lora in request.lora.iter_mut() {
-        lora.path = match build_path(model, &lora.path) {
+    for x in request.lora.iter_mut() {
+        x.path = match build_path(path, &x.path) {
             Ok(path) => path,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+            Err(_) => return StatusCode::NOT_FOUND,
+        }
+    }
+    for x in request.state.iter_mut() {
+        x.path = match build_path(path, &x.path) {
+            Ok(path) => path,
+            Err(_) => return StatusCode::NOT_FOUND,
         }
     }
 
@@ -47,12 +53,12 @@ pub async fn load(depot: &mut Depot, req: &mut Request) -> StatusCode {
 /// `/api/models/save`.
 #[handler]
 pub async fn save(depot: &mut Depot, req: &mut Request) -> StatusCode {
-    let ThreadState { sender, model } = depot.obtain::<ThreadState>().unwrap();
+    let ThreadState { sender, path } = depot.obtain::<ThreadState>().unwrap();
     let (result_sender, result_receiver) = flume::unbounded();
     let mut request: SaveRequest = req.parse_body().await.unwrap();
 
     // make sure that we are not visiting un-permitted path.
-    request.model_path = match build_path(model, &request.model_path) {
+    request.model_path = match build_path(path, request.model_path) {
         Ok(path) => path,
         Err(_) => return StatusCode::NOT_FOUND,
     };

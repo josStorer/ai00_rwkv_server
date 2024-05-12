@@ -9,11 +9,12 @@ use std::{
 
 use anyhow::Result;
 use bnf_sampler::{grammar::Grammar, sampler::AcceptTokenResult, vocabulary::Vocabulary};
+use derivative::Derivative;
 use flume::{Receiver, Sender};
-use half::f16;
 use itertools::Itertools;
 use qp_trie::Trie;
-use serde::Serialize;
+use salvo::oapi::ToSchema;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use web_rwkv::{
     context::Context,
@@ -247,7 +248,8 @@ impl<T> CachedItem<T> {
         }
     }
 
-    pub fn renew(cached: CachedItem<T>) -> Self {
+    /// Update an existing cache item's timestamp.
+    pub fn update(cached: CachedItem<T>) -> Self {
         Self {
             item: cached.item,
             instant: Instant::now(),
@@ -291,18 +293,80 @@ impl<M: Serialize> ModelSerialize for Model<M> {
     }
 }
 
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
+pub struct InitState {
+    pub name: String,
+    pub id: StateId,
+    pub default: bool,
+    #[derivative(Debug = "ignore")]
+    pub data: TensorCpu<f32>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, ToSchema, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StateId(uuid::Uuid);
+
+impl StateId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Default)]
+struct StateCacheItem {
+    state: Option<InitState>,
+    cache: Trie<Tokens, CachedItem<TensorCpu<f32>>>,
+}
+
+impl StateCacheItem {
+    fn maintain(&mut self) {
+        let cache = &mut self.cache;
+        if cache.count() <= MAX_CACHE_ITEMS {
+            return;
+        }
+
+        let mut remove = vec![];
+        for (tokens, _) in cache
+            .iter()
+            .sorted_unstable_by_key(|(_, item)| item.instant.elapsed())
+            .skip(MAX_CACHE_ITEMS)
+        {
+            remove.push(tokens.to_owned());
+        }
+
+        for tokens in remove.into_iter() {
+            cache.remove(&tokens);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct StateCache {
+    backed: HashMap<StateId, StateCacheItem>,
+    default: StateCacheItem,
+}
+
+impl StateCache {
+    fn fetch(&mut self, id: StateId) -> &mut StateCacheItem {
+        match self.backed.get_mut(&id) {
+            Some(item) => item,
+            None => &mut self.default,
+        }
+    }
+}
+
 pub struct Runtime {
     context: Context,
     reload: ReloadRequest,
     info: ModelInfo,
     state: Arc<dyn State + Send + Sync>,
     model: Arc<dyn ModelSerialize + Send + Sync>,
-    runtime: JobRuntime<InferInput, InferOutput<f16>>,
-    init_state: Option<TensorCpu<f32>>,
+    runtime: JobRuntime<InferInput, InferOutput>,
     tokenizer: Arc<Tokenizer>,
     vocab: Arc<Vocabulary>,
     slots: Mutex<Vec<SlotState>>,
-    backed: Mutex<Trie<Tokens, CachedItem<TensorCpu<f32>>>>,
+    caches: Mutex<StateCache>,
 }
 
 impl Runtime {
@@ -310,17 +374,32 @@ impl Runtime {
         context: Context,
         builder: B,
         reload: ReloadRequest,
-        init_state: Option<TensorCpu<f32>>,
+        states: Vec<InitState>,
         tokenizer: Tokenizer,
         vocab: Vocabulary,
     ) -> Self
         where
-            J: Job<Info = InferInfo, Input = InferChunk, Output = InferOutput<f16>>,
+            J: Job<Info = InferInfo, Input = InferChunk, Output = InferOutput>,
             B: JobBuilder<J, Info = InferInfo> + ModelRuntime,
     {
         let slots = (0..reload.max_batch)
             .map(|_| SlotState::default())
             .collect();
+
+        let mut caches = StateCache::default();
+
+        // set up default initial state
+        if let Some(state) = states.iter().find(|state| state.default) {
+            caches.default.state = Some(state.clone());
+        }
+        for state in states {
+            let id = state.id;
+            let item = StateCacheItem {
+                state: Some(state),
+                cache: Trie::new(),
+            };
+            caches.backed.insert(id, item);
+        }
 
         let info = builder.info();
         let state = Arc::new(builder.state());
@@ -334,12 +413,16 @@ impl Runtime {
             state,
             model,
             runtime,
-            init_state,
             tokenizer: Arc::new(tokenizer),
             vocab: Arc::new(vocab),
             slots: Mutex::new(slots),
-            backed: Mutex::new(Trie::new()),
+            caches: Mutex::new(caches),
         }
+    }
+
+    #[inline]
+    pub fn context(&self) -> &Context {
+        &self.context
     }
 
     #[inline]
@@ -362,6 +445,22 @@ impl Runtime {
         self.tokenizer.clone()
     }
 
+    pub async fn states(&self) -> Vec<(StateId, InitState)> {
+        let caches = self.caches.lock().await;
+        let mut states = vec![];
+
+        if let Some(state) = &caches.default.state {
+            states.push((state.id, state.clone()));
+        }
+        for item in caches.backed.values() {
+            if let Some(state) = &item.state {
+                states.push((state.id, state.clone()));
+            }
+        }
+
+        states
+    }
+
     pub async fn serialize_model(&self, path: PathBuf) -> Result<()> {
         let model = self.model.clone();
         let handle = tokio::task::spawn_blocking(move || {
@@ -373,8 +472,15 @@ impl Runtime {
 
     /// Search for the longest common prefix in the memory cache and checkout the state from that point.
     /// Should there be a cache miss, an initial state is returned.
-    async fn checkout(&self, tokens: &[u16], batch: usize) -> (Vec<u16>, Arc<TensorCpu<f32>>) {
-        let mut cache = self.backed.lock().await;
+    async fn checkout(
+        &self,
+        id: StateId,
+        tokens: &[u16],
+        batch: usize,
+    ) -> (Vec<u16>, Arc<TensorCpu<f32>>) {
+        let mut caches = self.caches.lock().await;
+
+        let StateCacheItem { state, cache } = caches.fetch(id);
         let prefix = cache.longest_common_prefix(tokens.as_token_slice());
         let len = (1..=prefix.len())
             .rev()
@@ -383,9 +489,10 @@ impl Runtime {
         log::info!("slot {} checks out backed cache of length {}", batch, len);
 
         let prefix = prefix[0..len].to_vec();
+        let state = state.clone().map(|state| state.data);
         let reload = match cache.remove(prefix[..].as_token_slice()) {
-            Some(reload) => CachedItem::renew(reload),
-            None => CachedItem::new(self.init_state.clone().unwrap_or_else(|| self.state.init())),
+            Some(reload) => CachedItem::update(reload),
+            None => CachedItem::new(state.unwrap_or_else(|| self.state.init())),
         };
         if len > 0 {
             let key = Tokens(prefix.clone());
@@ -464,7 +571,7 @@ impl Runtime {
             // back a non-relative and non-empty slot and use it for our new context
             Some(SlotChoice::Back(batch)) => {
                 log::info!("start at non-empty slot {}", batch);
-                let (prefix, reload) = self.checkout(&tokens, batch).await;
+                let (prefix, reload) = self.checkout(context.request.state, &tokens, batch).await;
                 self.state.load(batch, reload.as_ref().clone())?;
 
                 let tokens = [tokens, vec![last]].concat();
@@ -485,7 +592,7 @@ impl Runtime {
             // directly occupy an empty slot so no need backing
             Some(SlotChoice::Empty(batch)) => {
                 log::info!("start at empty slot {}", batch);
-                let (prefix, reload) = self.checkout(&tokens, batch).await;
+                let (prefix, reload) = self.checkout(context.request.state, &tokens, batch).await;
                 self.state.load(batch, reload.as_ref().clone())?;
 
                 let tokens = [tokens, vec![last]].concat();
@@ -550,7 +657,8 @@ impl Runtime {
                 let _ = context.sender.send(Token::Embed(embed));
             }
 
-            let mut cache = self.backed.lock().await;
+            let mut caches = self.caches.lock().await;
+            let cache = &mut caches.fetch(context.request.state).cache;
             cache.insert(context.prefix.clone(), CachedItem::new(backed));
             log::info!(
                 "backed completed slot {} of length {}",
@@ -567,7 +675,7 @@ impl Runtime {
             .iter()
             .filter(|x| matches!(x, Payload::Busy(_)))
             .count();
-        let remain = self.reload.max_runtime_batch - self.reload.max_runtime_batch.min(occupancy);
+        let remain = self.reload.max_batch - self.reload.max_batch.min(occupancy);
         let batches = slots
             .iter()
             .enumerate()
@@ -637,7 +745,7 @@ impl Runtime {
                     let sampler = context.request.sampler.clone();
                     let bias = context.request.bias.clone();
                     set.spawn(async move {
-                        let mut data = output.map(|x| x.to_f32()).to_vec();
+                        let mut data = output.to_vec();
                         assert_eq!(data.len(), num_vocab);
 
                         sampler.read().await.transform(&mut data);
@@ -647,9 +755,7 @@ impl Runtime {
                         if let Some(bnf) = bnf {
                             bnf.read().await.transform(&mut data);
                         }
-                        // data[0] = f32::MIN;
 
-                        let data = data.into_iter().map(f16::from_f32).collect_vec();
                         (batch, data)
                     });
                 }
@@ -681,7 +787,7 @@ impl Runtime {
                     let num_vocab = self.info.num_vocab;
                     let sampler = context.request.sampler.clone();
                     set.spawn(async move {
-                        let data = output.map(|x| x.to_f32()).to_vec();
+                        let data = output.to_vec();
                         assert_eq!(data.len(), num_vocab);
                         let token = sampler.write().await.sample(&data);
                         (batch, token)
@@ -719,7 +825,8 @@ impl Runtime {
 
             // cache the prompt if it is too long.
             if !context.prompt_cached && context.prompt_tokens.len() > PROMPT_CACHE_TOKENS {
-                let mut cache = self.backed.lock().await;
+                let mut caches = self.caches.lock().await;
+                let cache = &mut caches.fetch(context.request.state).cache;
                 let backed = self.state.back(batch).await?;
 
                 cache.insert(context.prefix.clone(), CachedItem::new(backed));
@@ -834,23 +941,9 @@ impl Runtime {
 
     /// Keep the items in the cache less then [`MAX_CACHE_ITEMS`].
     async fn maintain_cache(&self) {
-        let mut cache = self.backed.lock().await;
-        if cache.count() <= MAX_CACHE_ITEMS {
-            return;
-        }
-
-        let mut removing = vec![];
-        for (tokens, _) in cache
-            .iter()
-            .sorted_unstable_by_key(|(_, item)| item.instant.elapsed())
-            .skip(MAX_CACHE_ITEMS)
-        {
-            removing.push(tokens.to_owned());
-        }
-
-        for tokens in removing.into_iter() {
-            cache.remove(&tokens);
-        }
+        let mut caches = self.caches.lock().await;
+        caches.default.maintain();
+        caches.backed.iter_mut().for_each(|(_, x)| x.maintain());
     }
 }
 
